@@ -1,6 +1,12 @@
 __pycache__
-local_data.json
-.env
+.history
+.hypothesis/
+build/
+reports/
+.DS_Store
+.venv
 env
+bin/
+lib/
+share/
 .build
-scripts/__pycache__

@@ -1,4 +1,4 @@
-name: ape-alerts
+name: dinobot-alerts
 plugins:
   - name: solidity
     version: 0.4.0
