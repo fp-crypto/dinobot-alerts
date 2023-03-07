@@ -1,7 +1,11 @@
 import ape
-from fastapi import FastAPI, Response
 import uvicorn
+from fastapi import FastAPI, Request, Response, HTTPException
+from pydantic import BaseModel
 import telebot
+
+import asyncio
+import concurrent
 
 import hmac
 import hashlib
@@ -14,25 +18,30 @@ from ape import chain, project, networks
 
 # start ape network connect
 geth_url = environ["GETH_URL"]
-networks.parse_network_choice(f"ethereum:mainnet:{geth_url}").__enter__()
-signing_key = ""
+network = networks.parse_network_choice(f"ethereum:mainnet:{geth_url}")
 
-app = FastAPI()
+app = FastAPI(on_startup=[network.__enter__], on_shutdown=[network.__exit__])
 
 telegram_bot_key = environ["TELEGRAM_BOT_KEY"]
 bot = telebot.TeleBot(telegram_bot_key)
+alerts_enabled = (
+    True if "ALERTS_ENABLED" in environ and environ["ALERTS_ENABLED"] == "1" else False
+)
 
 etherscan_base_url = "https://etherscan.io/"
 
-trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"  #'0xcADBA199F3AC26F67f660C89d43eB1820b7f7a3b'
+trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
 barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
 prod_solver = "0x398890BE7c4FAC5d766E1AEFFde44B2EE99F38EF"
-settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
-oracle = project.ORACLE.at("0x83d95e0D5f402511dB06817Aff3f9eA88224B030")
-alerts_enabled = True
+signing_key = (
+    environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
+)
+
+sync_threads = concurrent.futures.ThreadPoolExecutor()
+
 
 CHAT_IDS = {
-    "WAVEY_ALERTS": "-789090497",
+    "WAVEY_ALERTS": "-881132649",
     "GNOSIS_CHAIN_POC": "-1001516144118",
 }
 
@@ -42,9 +51,6 @@ async def root():
     return {"message": "Hello World"}
 
 
-from pydantic import BaseModel
-
-
 class Alert(BaseModel):
     id: str
     event_type: str | None = None
@@ -52,10 +58,21 @@ class Alert(BaseModel):
 
 
 @app.post("/solver/solve", status_code=200, response_class=Response)
-async def alert_solver_solve(alert: Alert):
+async def alert_solver_solve(alert: Alert, request: Request):
+
+    if not await isValidSignature(request):
+        raise HTTPException(status_code=401, detail="Signature not valid")
 
     txn = alert.transaction
+    await asyncio.get_event_loop().run_in_executor(
+        sync_threads, generate_solver_alerts, txn
+    )
+
+
+def generate_solver_alerts(txn):
     receipt = networks.provider.get_receipt(txn["hash"])
+    settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
+
     logs = receipt.decode_logs([settlement.Settlement])
 
     for l in logs:
@@ -96,6 +113,7 @@ def calculate_slippage(trades, block):
 
 
 def enumerate_trades(receipt):
+    settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
     logs = receipt.decode_logs([settlement.Trade])
 
     trades = []
@@ -198,6 +216,8 @@ def format_solver_alert(solver, txn_hash, block, trade_data, slippages):
 
 
 def calc_gas_cost(txn_receipt):
+    oracle = project.ORACLE.at("0x83d95e0D5f402511dB06817Aff3f9eA88224B030")
+
     eth_used = txn_receipt.gas_price * txn_receipt.gas_used
     gas_cost = (
         oracle.getNormalizedValueUsdc(
@@ -217,7 +237,18 @@ def get_index_in_block(txn_hash):
         return 1_000_000  # Not found
 
 
-def isValidSignature(signature: string, body: bytes, timestamp: string):
+async def isValidSignature(request: Request) -> bool:
+    if signing_key == "":
+        return True
+
+    if not "X-Tenderly-Signature" in request.headers:
+        return False
+
+    signature = request.headers["X-Tenderly-Signature"]
+    timestamp = request.headers["Date"]
+
+    body = await request.body()
+
     h = hmac.new(str.encode(signing_key), body, hashlib.sha256)
     h.update(str.encode(timestamp))
     digest = h.hexdigest()

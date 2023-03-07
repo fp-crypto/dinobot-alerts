@@ -1,5 +1,9 @@
 FROM python:3.10.10
 
+# Allow statements and log messages to immediately appear in the Knative logs
+ENV PYTHONUNBUFFERED True
+ENV PORT 8000
+
 WORKDIR /app
 
 COPY requirements.txt requirements.txt
@@ -10,4 +14,4 @@ RUN ape compile
 
 COPY src/ src/
 
-ENTRYPOINT [ "python", "src/main.py" ]
+ENTRYPOINT uvicorn --host "0.0.0.0" --port $PORT "src.main:app"
