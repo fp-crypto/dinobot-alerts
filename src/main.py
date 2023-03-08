@@ -66,6 +66,10 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         sync_threads, generate_solver_alerts, txn
     )
 
+    # Check again
+    if hash in _processed_hashes:
+        return {"success": True, "is_redundant": True}
+
     calls = []
     for msg in msgs:
         calls.append(send_message(msg))
@@ -77,7 +81,8 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
 
 
 def generate_solver_alerts(txn) -> list[str]:
-    receipt = networks.provider.get_receipt(txn["hash"])
+    txn_hash = txn["hash"]
+    receipt = networks.provider.get_receipt(txn_hash)
 
     settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
 
@@ -86,7 +91,6 @@ def generate_solver_alerts(txn) -> list[str]:
     alerts: list[str] = []
 
     for l in logs:
-        txn_hash = l.transaction_hash
         solver = l.dict()["event_arguments"]["solver"]
         if solver not in [barn_solver, prod_solver]:
             continue
