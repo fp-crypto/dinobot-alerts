@@ -1,29 +1,24 @@
-import ape
-import uvicorn
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-import telebot
+from ape import chain, project, networks
+from telebot.async_telebot import AsyncTeleBot
 
 import asyncio
 import concurrent
 
 import hmac
 import hashlib
-import string
 from datetime import datetime
 from os import environ
 
-from ape import chain, project, networks
 
-
-# start ape network connect
 geth_url = environ["GETH_URL"]
 network = networks.parse_network_choice(f"ethereum:mainnet:{geth_url}")
 
 app = FastAPI(on_startup=[network.__enter__], on_shutdown=[network.__exit__])
 
 telegram_bot_key = environ["TELEGRAM_BOT_KEY"]
-bot = telebot.TeleBot(telegram_bot_key)
+bot = AsyncTeleBot(telegram_bot_key)
 alerts_enabled = (
     True if "ALERTS_ENABLED" in environ and environ["ALERTS_ENABLED"] == "1" else False
 )
@@ -41,14 +36,9 @@ sync_threads = concurrent.futures.ThreadPoolExecutor()
 
 
 CHAT_IDS = {
-    "WAVEY_ALERTS": "-881132649",
-    "GNOSIS_CHAIN_POC": "-1001516144118",
+    "FP_ALERTS": "-881132649",
+    "SEASOLVER": "-1001516144118",
 }
-
-
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
 
 
 class Alert(BaseModel):
@@ -57,23 +47,43 @@ class Alert(BaseModel):
     transaction: dict
 
 
-@app.post("/solver/solve", status_code=200, response_class=Response)
-async def alert_solver_solve(alert: Alert, request: Request):
+_processed_hashes: set[str] = set()
+
+
+@app.post("/solver/solve", status_code=200)
+async def alert_solver_solve(alert: Alert, request: Request) -> dict:
 
     if not await isValidSignature(request):
         raise HTTPException(status_code=401, detail="Signature not valid")
 
     txn = alert.transaction
-    await asyncio.get_event_loop().run_in_executor(
+    hash = txn["hash"]
+
+    if hash in _processed_hashes:
+        return {"success": True, "is_redundant": True}
+
+    msgs = await asyncio.get_event_loop().run_in_executor(
         sync_threads, generate_solver_alerts, txn
     )
 
+    calls = []
+    for msg in msgs:
+        calls.append(send_message(msg))
+    await asyncio.gather(*calls)
 
-def generate_solver_alerts(txn):
+    _processed_hashes.add(hash)
+
+    return {"success": True}
+
+
+def generate_solver_alerts(txn) -> list[str]:
     receipt = networks.provider.get_receipt(txn["hash"])
+
     settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
 
     logs = receipt.decode_logs([settlement.Settlement])
+
+    alerts: list[str] = []
 
     for l in logs:
         txn_hash = l.transaction_hash
@@ -83,7 +93,9 @@ def generate_solver_alerts(txn):
         block = l.block_number
         trades = enumerate_trades(receipt)
         slippage = calculate_slippage(trades, block)
-        format_solver_alert(solver, txn_hash, block, trades, slippage)
+        alerts.append(format_solver_alert(solver, txn_hash, block, trades, slippage))
+
+    return alerts
 
 
 def calculate_slippage(trades, block):
@@ -165,7 +177,7 @@ def enumerate_trades(receipt):
     return trades
 
 
-def format_solver_alert(solver, txn_hash, block, trade_data, slippages):
+def format_solver_alert(solver, txn_hash, block, trade_data, slippages) -> str:
 
     prod_solver = "0x398890BE7c4FAC5d766E1AEFFde44B2EE99F38EF"
     cow_explorer_url = f'https://explorer.cow.fi/orders/{trade_data[0]["order_uid"]}'
@@ -206,13 +218,7 @@ def format_solver_alert(solver, txn_hash, block, trade_data, slippages):
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
 
-    # Add slippage info
-
-    if alerts_enabled:
-        chat_id = CHAT_IDS["GNOSIS_CHAIN_POC"]
-    else:
-        chat_id = CHAT_IDS["WAVEY_ALERTS"]
-    bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview=True)
+    return msg
 
 
 def calc_gas_cost(txn_receipt):
@@ -237,6 +243,16 @@ def get_index_in_block(txn_hash):
         return 1_000_000  # Not found
 
 
+async def send_message(msg):
+    if alerts_enabled:
+        chat_id = CHAT_IDS["SEASOLVER"]
+    else:
+        chat_id = CHAT_IDS["FP_ALERTS"]
+    return await bot.send_message(
+        chat_id, msg, parse_mode="markdown", disable_web_page_preview=True
+    )
+
+
 async def isValidSignature(request: Request) -> bool:
     if signing_key == "":
         return True
@@ -256,4 +272,6 @@ async def isValidSignature(request: Request) -> bool:
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run("__main__:app", host="0.0.0.0")
