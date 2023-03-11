@@ -10,6 +10,7 @@ import hmac
 import hashlib
 from datetime import datetime
 from os import environ
+from functools import lru_cache
 
 
 geth_url = environ["GETH_URL"]
@@ -80,6 +81,33 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
     return {"success": True}
 
 
+@app.post("/solver/revert", status_code=200)
+async def alert_solver_revert(alert: Alert, request: Request) -> dict:
+
+    if not await isValidSignature(request):
+        raise HTTPException(status_code=401, detail="Signature not valid")
+
+    txn = alert.transaction
+    hash = txn["hash"]
+
+    if hash in _processed_hashes:
+        return {"success": True, "is_redundant": True}
+
+    msg = await asyncio.get_event_loop().run_in_executor(
+        sync_threads, process_revert, txn
+    )
+
+    # Check again
+    if hash in _processed_hashes:
+        return {"success": True, "is_redundant": True}
+
+    await send_message(msg)
+
+    _processed_hashes.add(hash)
+
+    return {"success": True}
+
+
 def generate_solver_alerts(txn) -> list[str]:
     txn_hash = txn["hash"]
     receipt = networks.provider.get_receipt(txn_hash)
@@ -135,43 +163,18 @@ def enumerate_trades(receipt):
     trades = []
     for l in logs:
         args = l.dict()["event_arguments"]
-        eth = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
-        try:
-            sell_token = args["sellToken"]
-            if sell_token == eth:
-                sell_token_symbol = "ETH"
-                sell_token_decimals = 18
-            else:
-                sell_token_symbol = project.ERC20.at(sell_token).symbol()
-                sell_token_decimals = project.ERC20.at(sell_token).decimals()
-        except:
-            sell_token_symbol = "? Cannot Find ?"
-            if sell_token == "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2":
-                sell_token_symbol = "MKR"
-            sell_token_decimals = 18
 
-        try:
-            buy_token = args["buyToken"]
-            if buy_token == eth:
-                buy_token_symbol = "ETH"
-                buy_token_decimals = 18
-            else:
-                buy_token_symbol = project.ERC20.at(buy_token).symbol()
-                buy_token_decimals = project.ERC20.at(buy_token).decimals()
-        except:
-            buy_token_symbol = "? Cannot Find ?"
-            if buy_token == "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2":
-                buy_token_symbol = "MKR"
-            buy_token_decimals = 18
+        sell_token = _token_info(args["sellToken"])
+        buy_token = _token_info(args["buyToken"])
 
         trade = {
             "owner": args["owner"],
             "sell_token_address": args["sellToken"],
-            "sell_token_symbol": sell_token_symbol,
-            "sell_token_decimals": sell_token_decimals,
+            "sell_token_symbol": sell_token.symbol,
+            "sell_token_decimals": sell_token.decimals,
             "buy_token_address": args["buyToken"],
-            "buy_token_symbol": buy_token_symbol,
-            "buy_token_decimals": buy_token_decimals,
+            "buy_token_symbol": buy_token.symbol,
+            "buy_token_decimals": buy_token.decimals,
             "sell_amount": args["sellAmount"],
             "buy_amount": args["buyAmount"],
             "fee_amount": args["feeAmount"],
@@ -238,6 +241,23 @@ def calc_gas_cost(txn_receipt):
     return f"💸 ${round(gas_cost,2):,} | {round(eth_used/1e18,4)} ETH"
 
 
+def process_revert(txn) -> None | str:
+    txn_hash = txn["hash"]
+    txn_receipt = networks.provider.get_receipt(txn_hash)
+
+    failed = txn_receipt.failed
+    sender = txn_receipt.transaction.sender
+    if not failed or sender not in [barn_solver, prod_solver]:
+        return
+    msg = f"*🤬  Failed Transaction detected!*\n\n"
+    e = "🧜‍♂️" if sender == prod_solver else "🐓"
+    _, _, markdown = abbreviate_address(sender)
+    msg += f"Sent from {markdown} {e}\n\n"
+    msg += f"{calc_gas_cost(txn_receipt)}"
+    msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Tenderly](https://dashboard.tenderly.co/tx/mainnet/{txn_hash})"
+    return msg
+
+
 def get_index_in_block(txn_hash):
     tx = chain.provider.get_receipt(txn_hash)
     hashes = [x.txn_hash.hex() for x in chain.blocks[tx.block_number].transactions]
@@ -245,6 +265,13 @@ def get_index_in_block(txn_hash):
         return hashes.index(tx.txn_hash)
     except:
         return 1_000_000  # Not found
+
+
+def abbreviate_address(address):
+    link = f"https://etherscan.io/address/{address}"
+    abbr = address[0:7]
+    markdown = f"[{abbr}...]({link})"
+    return abbr, link, markdown
 
 
 async def send_message(msg):
@@ -273,6 +300,36 @@ async def isValidSignature(request: Request) -> bool:
     h.update(str.encode(timestamp))
     digest = h.hexdigest()
     return hmac.compare_digest(signature, digest)
+
+
+class TokenInfo:
+    addr: str
+    symbol: str
+    decimals: int
+
+
+eth = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+mkr = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+
+
+@lru_cache
+def _token_info(addr: str) -> TokenInfo:
+    token = project.ERC20.at(addr)
+    token_info = TokenInfo()
+    token_info.addr = addr
+    if addr == eth:
+        token_info.decimals = 18
+        token_info.symbol = "ETH"
+    elif addr == mkr:
+        token_info.decimals = 18
+        token_info.symbol = "MKR"
+    else:
+        token_info.decimals = token.decimals()
+        try:
+            token_info.symbol = token.symbol()
+        except:
+            token_info.symbol = "? Cannot Find ?"
+    return token_info
 
 
 if __name__ == "__main__":
