@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ape import chain, project, networks
+from ape.contracts import ContractInstance
 from telebot.async_telebot import AsyncTeleBot
 
 import asyncio
@@ -148,7 +149,7 @@ def calculate_slippage(trades, block):
         if buy_token_address in slippages:
             continue
 
-        buy_token = project.ERC20.at(buy_token_address)
+        buy_token = _token_info(buy_token_address).contract
         before = buy_token.balanceOf(trade_handler, block_identifier=block - 1)
         after = buy_token.balanceOf(trade_handler, block_identifier=block + 1)
         slippages[buy_token_address] = after - before
@@ -214,12 +215,12 @@ def format_solver_alert(solver, txn_hash, block, trade_data, slippages) -> str:
         msg += f'    [ 🐻‍❄️ ]({tonkers_base_url}{t["sell_token_address"]}/{buy_token}) | [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
     msg += "\n✂️ *Slippages*"
     for key in slippages:
-        token = project.ERC20.at(key)
+        token = _token_info(key)
         slippage = slippages[key]
         color = "🔴" if slippage < 0 else "🟢"
-        amount = round(slippage / 10 ** token.decimals(), 4)
+        amount = round(slippage / 10**token.decimals, 4)
         try:
-            msg += f"\n   {color} {token.symbol()}: {amount}"
+            msg += f"\n   {color} {token.symbol}: {amount}"
         except:
             msg += f"\n   {color} -SymbolError-: {amount}"
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
@@ -306,6 +307,7 @@ class TokenInfo:
     addr: str
     symbol: str
     decimals: int
+    contract: ContractInstance
 
 
 eth = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
@@ -317,6 +319,7 @@ def _token_info(addr: str) -> TokenInfo:
     token = project.ERC20.at(addr)
     token_info = TokenInfo()
     token_info.addr = addr
+    token_info.contract = token
     if addr == eth:
         token_info.decimals = 18
         token_info.symbol = "ETH"
