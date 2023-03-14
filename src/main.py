@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ape import chain, project, networks
 from ape.contracts import ContractInstance
+from ape.api.transactions import ReceiptAPI
 from telebot.async_telebot import AsyncTeleBot
 
 import asyncio
@@ -125,15 +126,20 @@ def generate_solver_alerts(txn) -> list[str]:
             continue
         block = l.block_number
         trades = enumerate_trades(receipt)
-        slippage = calculate_slippage(trades, block)
+        slippage = calculate_slippage(receipt, trades)
         alerts.append(format_solver_alert(solver, txn_hash, block, trades, slippage))
 
     return alerts
 
 
-def calculate_slippage(trades, block):
+def calculate_slippage(receipt: ReceiptAPI, trades: list[dict]):
 
     slippages = {}
+
+    transfer_logs = receipt.decode_logs(
+        [project.ERC20.contract_type.events["Transfer"]]
+    )
+
     for trade in trades:
         buy_token_address = trade["buy_token_address"]
 
@@ -149,15 +155,24 @@ def calculate_slippage(trades, block):
         if buy_token_address in slippages:
             continue
 
-        buy_token = _token_info(buy_token_address).contract
-        before = buy_token.balanceOf(trade_handler, block_identifier=block - 1)
-        after = buy_token.balanceOf(trade_handler, block_identifier=block + 1)
-        slippages[buy_token_address] = after - before
+        token_transfers = [
+            l.dict()["event_arguments"]
+            for l in transfer_logs
+            if l.contract_address == buy_token_address
+        ]
+
+        amount_in = sum(
+            [l["value"] for l in token_transfers if l["to"] == trade_handler]
+        )
+        amount_out = sum(
+            [l["value"] for l in token_transfers if l["from"] == trade_handler]
+        )
+        slippages[buy_token_address] = amount_out - amount_in
 
     return slippages
 
 
-def enumerate_trades(receipt):
+def enumerate_trades(receipt: ReceiptAPI) -> list[dict]:
     settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
     logs = receipt.decode_logs([settlement.Trade])
 
