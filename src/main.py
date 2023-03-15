@@ -12,6 +12,7 @@ import hmac
 import hashlib
 from datetime import datetime
 from os import environ
+from dataclasses import dataclass
 from functools import lru_cache
 
 
@@ -31,6 +32,7 @@ etherscan_base_url = "https://etherscan.io/"
 trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
 barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
 prod_solver = "0x398890BE7c4FAC5d766E1AEFFde44B2EE99F38EF"
+solvers = [barn_solver, prod_solver]
 signing_key = (
     environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
 )
@@ -42,6 +44,10 @@ CHAT_IDS = {
     "FP_ALERTS": "-881132649",
     "SEASOLVER": "-1001516144118",
 }
+
+ETH_ADDR = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+WETH_ADDR = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+MKR_ADDR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
 
 
 class Alert(BaseModel):
@@ -56,6 +62,10 @@ _processed_hashes: set[str] = set()
 @app.post("/solver/solve", status_code=200)
 async def alert_solver_solve(alert: Alert, request: Request) -> dict:
 
+    # import time
+
+    # start = time.time()
+
     if not await isValidSignature(request):
         raise HTTPException(status_code=401, detail="Signature not valid")
 
@@ -69,6 +79,8 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         sync_threads, generate_solver_alerts, txn
     )
 
+    # trades_processed = time.time()
+
     # Check again
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
@@ -78,7 +90,12 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         calls.append(send_message(msg))
     await asyncio.gather(*calls)
 
+    # msgs_sent = time.time()
+
     _processed_hashes.add(hash)
+
+    # print(trades_processed - start)
+    # print(msgs_sent - trades_processed)
 
     return {"success": True}
 
@@ -111,45 +128,46 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
 
 
 def generate_solver_alerts(txn) -> list[str]:
+
     txn_hash = txn["hash"]
     receipt = networks.provider.get_receipt(txn_hash)
-
     settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
 
-    logs = receipt.decode_logs([settlement.Settlement])
+    target_logs = receipt.decode_logs(
+        [
+            settlement.Settlement,
+            settlement.Trade,
+            project.ERC20.contract_type.events["Transfer"],
+        ]
+    )
 
-    alerts: list[str] = []
+    settlement_logs = [l for l in target_logs if l.event_name == "Settlement"]
+    trade_logs = [l for l in target_logs if l.event_name == "Trade"]
+    transfer_logs = [l for l in target_logs if l.event_name == "Transfer"]
 
-    for l in logs:
-        solver = l.dict()["event_arguments"]["solver"]
-        if solver not in [barn_solver, prod_solver]:
-            continue
-        block = l.block_number
-        trades = enumerate_trades(receipt)
-        slippage = calculate_slippage(receipt, trades)
-        alerts.append(format_solver_alert(solver, txn_hash, block, trades, slippage))
+    solvers = [l.dict()["event_arguments"]["solver"] for l in settlement_logs]
+    solver = next((solver for solver in solvers if solver in solvers), None)
+    if solver == None:
+        return []
+
+    trades = enumerate_trades(trade_logs)
+    slippage = calculate_slippage(trades, transfer_logs)
+    alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
     return alerts
 
 
-def calculate_slippage(receipt: ReceiptAPI, trades: list[dict]):
+def calculate_slippage(trades: list[dict], transfer_logs):
 
     slippages = {}
-
-    transfer_logs = receipt.decode_logs(
-        [project.ERC20.contract_type.events["Transfer"]]
-    )
 
     for trade in trades:
         buy_token_address = trade["buy_token_address"]
 
         # If there is a trade for eth, use weth instead since TH will never
         # get native eth
-        if (
-            buy_token_address.lower()
-            == "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower()
-        ):
-            buy_token_address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        if buy_token_address.lower() == ETH_ADDR.lower():
+            buy_token_address = WETH_ADDR
 
         # we might have calculated the slippage previously
         if buy_token_address in slippages:
@@ -167,16 +185,14 @@ def calculate_slippage(receipt: ReceiptAPI, trades: list[dict]):
         amount_out = sum(
             [l["value"] for l in token_transfers if l["from"] == trade_handler]
         )
-        slippages[buy_token_address] = amount_out - amount_in
+        slippages[buy_token_address] = amount_in - amount_out
 
     return slippages
 
 
-def enumerate_trades(receipt: ReceiptAPI) -> list[dict]:
-    settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
-    logs = receipt.decode_logs([settlement.Trade])
+def enumerate_trades(logs) -> list[dict]:
+    trades: list[dict] = []
 
-    trades = []
     for l in logs:
         args = l.dict()["event_arguments"]
 
@@ -200,20 +216,21 @@ def enumerate_trades(receipt: ReceiptAPI) -> list[dict]:
     return trades
 
 
-def format_solver_alert(solver, txn_hash, block, trade_data, slippages) -> str:
+def format_solver_alert(
+    solver,
+    txn_hash: str,
+    txn_receipt: ReceiptAPI,
+    trade_data: list[dict],
+    slippages: dict,
+) -> str:
 
-    prod_solver = "0x398890BE7c4FAC5d766E1AEFFde44B2EE99F38EF"
     cow_explorer_url = f'https://explorer.cow.fi/orders/{trade_data[0]["order_uid"]}'
     cow_explorer_url = f"https://explorer.cow.fi/tx/{txn_hash}"
     ethtx_explorer_url = f"https://ethtx.info/mainnet/{txn_hash}"
-    tonkers_base_url = f"https://prod.seasolver.dev/1/route/"
     eigen_url = f"https://eigenphi.io/mev/eigentx/{txn_hash}"
     barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
-    if solver == barn_solver:
-        tonkers_base_url = f"https://barn.seasolver.dev/1/route/"
-    txn_receipt = networks.provider.get_receipt(txn_hash)
-    ts = chain.blocks[block].timestamp
-    index = get_index_in_block(txn_hash)
+    ts = chain.blocks[txn_receipt.block_number].timestamp
+    index = get_index_in_block(txn_receipt)
     index = index if index != 1_000_000 else "???"
 
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
@@ -227,17 +244,14 @@ def format_solver_alert(solver, txn_hash, block, trade_data, slippages) -> str:
         buy_token = t["buy_token_address"]
         if buy_token.lower() == "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower():
             buy_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-        msg += f'    [ 🐻‍❄️ ]({tonkers_base_url}{t["sell_token_address"]}/{buy_token}) | [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
+        msg += f'    [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
     msg += "\n✂️ *Slippages*"
     for key in slippages:
         token = _token_info(key)
         slippage = slippages[key]
         color = "🔴" if slippage < 0 else "🟢"
         amount = round(slippage / 10**token.decimals, 4)
-        try:
-            msg += f"\n   {color} {token.symbol}: {amount}"
-        except:
-            msg += f"\n   {color} -SymbolError-: {amount}"
+        msg += f"\n   {color} {token.symbol}: {amount}"
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
 
@@ -263,7 +277,7 @@ def process_revert(txn) -> None | str:
 
     failed = txn_receipt.failed
     sender = txn_receipt.transaction.sender
-    if not failed or sender not in [barn_solver, prod_solver]:
+    if not failed or sender not in solvers:
         return
     msg = f"*🤬  Failed Transaction detected!*\n\n"
     e = "🧜‍♂️" if sender == prod_solver else "🐓"
@@ -274,8 +288,7 @@ def process_revert(txn) -> None | str:
     return msg
 
 
-def get_index_in_block(txn_hash):
-    tx = chain.provider.get_receipt(txn_hash)
+def get_index_in_block(tx: ReceiptAPI):
     hashes = [x.txn_hash.hex() for x in chain.blocks[tx.block_number].transactions]
     try:
         return hashes.index(tx.txn_hash)
@@ -318,36 +331,32 @@ async def isValidSignature(request: Request) -> bool:
     return hmac.compare_digest(signature, digest)
 
 
+@dataclass
 class TokenInfo:
     addr: str
     symbol: str
     decimals: int
-    contract: ContractInstance
-
-
-eth = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
-mkr = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+    contract: ContractInstance | None
 
 
 @lru_cache
 def _token_info(addr: str) -> TokenInfo:
     token = project.ERC20.at(addr)
-    token_info = TokenInfo()
-    token_info.addr = addr
-    token_info.contract = token
-    if addr == eth:
-        token_info.decimals = 18
-        token_info.symbol = "ETH"
-    elif addr == mkr:
-        token_info.decimals = 18
-        token_info.symbol = "MKR"
-    else:
-        token_info.decimals = token.decimals()
-        try:
-            token_info.symbol = token.symbol()
-        except:
-            token_info.symbol = "? Cannot Find ?"
-    return token_info
+    if addr == ETH_ADDR:
+        return TokenInfo(addr, "ETH", 18, None)
+    elif addr == MKR_ADDR:
+        return TokenInfo(addr, "WETH", 18, token)
+    elif addr == MKR_ADDR:
+        return TokenInfo(addr, "MKR", 18, token)
+
+    decimals = token.decimals()
+
+    try:
+        symbol = token.symbol()
+    except:
+        symbol = "? Cannot Find ?"
+
+    return TokenInfo(addr, symbol, decimals, token)
 
 
 if __name__ == "__main__":
