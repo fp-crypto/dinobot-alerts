@@ -62,10 +62,6 @@ _processed_hashes: set[str] = set()
 @app.post("/solver/solve", status_code=200)
 async def alert_solver_solve(alert: Alert, request: Request) -> dict:
 
-    # import time
-
-    # start = time.time()
-
     if not await isValidSignature(request):
         raise HTTPException(status_code=401, detail="Signature not valid")
 
@@ -79,8 +75,6 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         sync_threads, generate_solver_alerts, txn
     )
 
-    # trades_processed = time.time()
-
     # Check again
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
@@ -90,12 +84,7 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         calls.append(send_message(msg))
     await asyncio.gather(*calls)
 
-    # msgs_sent = time.time()
-
     _processed_hashes.add(hash)
-
-    # print(trades_processed - start)
-    # print(msgs_sent - trades_processed)
 
     return {"success": True}
 
