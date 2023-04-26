@@ -58,6 +58,7 @@ class Alert(BaseModel):
 
 _processed_hashes: set[str] = set()
 
+notification_lock = asyncio.Lock()
 
 @app.post("/solver/solve", status_code=200)
 async def alert_solver_solve(alert: Alert, request: Request) -> dict:
@@ -72,19 +73,20 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         return {"success": True, "is_redundant": True}
 
     msgs = await asyncio.get_event_loop().run_in_executor(
-        sync_threads, generate_solver_alerts, txn
+        sync_threads, generate_solver_alerts, hash
     )
 
-    # Check again
-    if hash in _processed_hashes:
-        return {"success": True, "is_redundant": True}
+    async with notification_lock:
+        # Check again
+        if hash in _processed_hashes:
+            return {"success": True, "is_redundant": True}
 
-    calls = []
-    for msg in msgs:
-        calls.append(send_message(msg))
-    await asyncio.gather(*calls)
+        calls = []
+        for msg in msgs:
+            calls.append(send_message(msg))
+        await asyncio.gather(*calls)
 
-    _processed_hashes.add(hash)
+        _processed_hashes.add(hash)
 
     return {"success": True}
 
@@ -102,23 +104,23 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
         return {"success": True, "is_redundant": True}
 
     msg = await asyncio.get_event_loop().run_in_executor(
-        sync_threads, process_revert, txn
+        sync_threads, process_revert, hash
     )
 
-    # Check again
-    if hash in _processed_hashes:
-        return {"success": True, "is_redundant": True}
+    async with notification_lock:
+        # Check again
+        if hash in _processed_hashes:
+            return {"success": True, "is_redundant": True}
 
-    await send_message(msg)
+        await send_message(msg)
 
-    _processed_hashes.add(hash)
+        _processed_hashes.add(hash)
 
     return {"success": True}
 
 
-def generate_solver_alerts(txn) -> list[str]:
+def generate_solver_alerts(txn_hash: str) -> list[str]:
 
-    txn_hash = txn["hash"]
     receipt = networks.provider.get_receipt(txn_hash)
     settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
 
@@ -217,7 +219,6 @@ def format_solver_alert(
     cow_explorer_url = f"https://explorer.cow.fi/tx/{txn_hash}"
     ethtx_explorer_url = f"https://ethtx.info/mainnet/{txn_hash}"
     eigen_url = f"https://eigenphi.io/mev/eigentx/{txn_hash}"
-    barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
     ts = chain.blocks[txn_receipt.block_number].timestamp
     index = get_index_in_block(txn_receipt)
     index = index if index != 1_000_000 else "???"
@@ -260,8 +261,7 @@ def calc_gas_cost(txn_receipt):
     return f"💸 ${round(gas_cost,2):,} | {round(eth_used/1e18,4)} ETH"
 
 
-def process_revert(txn) -> None | str:
-    txn_hash = txn["hash"]
+def process_revert(txn_hash: str) -> None | str:
     txn_receipt = networks.provider.get_receipt(txn_hash)
 
     failed = txn_receipt.failed
