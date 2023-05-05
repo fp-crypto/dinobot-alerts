@@ -34,8 +34,8 @@ cowswap_prod_api_base_url = "https://api.cow.fi/mainnet/api/v1/"
 cowswap_barn_api_base_url = "https://barn.api.cow.fi/mainnet/api/v1/"
 
 trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
-barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
-prod_solver = "0x398890BE7c4FAC5d766E1AEFFde44B2EE99F38EF"
+barn_solver = "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330"
+prod_solver = "0x43872b55A12E087935765611851E94e3f0a79249"
 solvers = [barn_solver, prod_solver]
 signing_key = (
     environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
