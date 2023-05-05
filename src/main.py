@@ -4,6 +4,8 @@ from ape import chain, project, networks
 from ape.contracts import ContractInstance
 from ape.api.transactions import ReceiptAPI
 from telebot.async_telebot import AsyncTeleBot
+from requests import Session as ClientSession
+from requests.adapters import HTTPAdapter, Retry
 
 import asyncio
 import concurrent
@@ -28,6 +30,8 @@ alerts_enabled = (
 )
 
 etherscan_base_url = "https://etherscan.io/"
+cowswap_prod_api_base_url = "https://api.cow.fi/mainnet/api/v1/"
+cowswap_barn_api_base_url = "https://barn.api.cow.fi/mainnet/api/v1/"
 
 trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
 barn_solver = "0x8a4e90e9AFC809a69D2a3BDBE5fff17A12979609"
@@ -39,15 +43,17 @@ signing_key = (
 
 sync_threads = concurrent.futures.ThreadPoolExecutor()
 
-
 CHAT_IDS = {
     "FP_ALERTS": "-881132649",
     "SEASOLVER": "-1001516144118",
+    "SEASOLVER_SA": "-1001829083462",
 }
 
 ETH_ADDR = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 WETH_ADDR = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 MKR_ADDR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+
+COW_SWAP_ETH_FLOW_ADDR = "0x40A50cf069e992AA4536211B23F286eF88752187"
 
 
 class Alert(BaseModel):
@@ -59,6 +65,7 @@ class Alert(BaseModel):
 _processed_hashes: set[str] = set()
 
 notification_lock = asyncio.Lock()
+
 
 @app.post("/solver/solve", status_code=200)
 async def alert_solver_solve(alert: Alert, request: Request) -> dict:
@@ -141,7 +148,7 @@ def generate_solver_alerts(txn_hash: str) -> list[str]:
     if solver == None:
         return []
 
-    trades = enumerate_trades(trade_logs)
+    trades = enumerate_trades(trade_logs, is_barn=solver.lower() == barn_solver.lower())
     slippage = calculate_slippage(trades, transfer_logs)
     alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
@@ -181,7 +188,7 @@ def calculate_slippage(trades: list[dict], transfer_logs):
     return slippages
 
 
-def enumerate_trades(logs) -> list[dict]:
+def enumerate_trades(logs, is_barn=False) -> list[dict]:
     trades: list[dict] = []
 
     for l in logs:
@@ -190,8 +197,23 @@ def enumerate_trades(logs) -> list[dict]:
         sell_token = _token_info(args["sellToken"])
         buy_token = _token_info(args["buyToken"])
 
+        owner = args["owner"]
+        order_uid = "0x" + args["orderUid"].hex()
+
+        if (
+            sell_token.addr.lower() == WETH_ADDR.lower()
+            and owner.lower() == COW_SWAP_ETH_FLOW_ADDR.lower()
+        ):
+            req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
+            with get_http_session().get(req_url) as r:
+                assert r.status_code == 200
+                r_json = r.json()
+                if "onchainUser" in r_json:
+                    owner = r_json["onchainUser"]
+                    sell_token.symbol = "ETH"
+
         trade = {
-            "owner": args["owner"],
+            "owner": owner,
             "sell_token_address": args["sellToken"],
             "sell_token_symbol": sell_token.symbol,
             "sell_token_decimals": sell_token.decimals,
@@ -201,9 +223,10 @@ def enumerate_trades(logs) -> list[dict]:
             "sell_amount": args["sellAmount"],
             "buy_amount": args["buyAmount"],
             "fee_amount": args["feeAmount"],
-            "order_uid": "0x" + args["orderUid"].hex(),
+            "order_uid": order_uid,
         }
         trades.append(trade)
+
     return trades
 
 
@@ -294,11 +317,16 @@ def abbreviate_address(address):
 
 async def send_message(msg):
     if alerts_enabled:
-        chat_id = CHAT_IDS["SEASOLVER"]
+        chat_ids = [CHAT_IDS["SEASOLVER"], CHAT_IDS["SEASOLVER_SA"]]
     else:
-        chat_id = CHAT_IDS["FP_ALERTS"]
-    return await bot.send_message(
-        chat_id, msg, parse_mode="markdown", disable_web_page_preview=True
+        chat_ids = [CHAT_IDS["FP_ALERTS"]]
+    return await asyncio.wait(
+        [
+            bot.send_message(
+                chat_id, msg, parse_mode="markdown", disable_web_page_preview=True
+            )
+            for chat_id in chat_ids
+        ]
     )
 
 
@@ -346,6 +374,17 @@ def _token_info(addr: str) -> TokenInfo:
         symbol = "? Cannot Find ?"
 
     return TokenInfo(addr, symbol, decimals, token)
+
+
+@lru_cache()
+def get_http_session() -> ClientSession:
+    client_session = ClientSession()
+    retries = Retry(
+        total=2,
+        status_forcelist=[400, 403, 429, 500, 503],
+    )
+    client_session.mount("http://", HTTPAdapter(max_retries=retries))
+    return client_session
 
 
 if __name__ == "__main__":
