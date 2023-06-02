@@ -136,12 +136,18 @@ def generate_solver_alerts(txn_hash: str) -> list[str]:
             settlement.Settlement,
             settlement.Trade,
             project.ERC20.contract_type.events["Transfer"],
+            project.WETH.contract_type.events["Withdrawal"],
         ]
     )
 
     settlement_logs = [l for l in target_logs if l.event_name == "Settlement"]
     trade_logs = [l for l in target_logs if l.event_name == "Trade"]
     transfer_logs = [l for l in target_logs if l.event_name == "Transfer"]
+    weth_burn_logs = [
+        l
+        for l in target_logs
+        if l.event_name == "Withdrawal" and l.contract_address == WETH_ADDR
+    ]
 
     solvers = [l.dict()["event_arguments"]["solver"] for l in settlement_logs]
     solver = next((solver for solver in solvers if solver in solvers), None)
@@ -149,15 +155,16 @@ def generate_solver_alerts(txn_hash: str) -> list[str]:
         return []
 
     trades = enumerate_trades(trade_logs, is_barn=solver.lower() == barn_solver.lower())
-    slippage = calculate_slippage(trades, transfer_logs)
+    slippage = calculate_slippage(trades, transfer_logs, weth_burn_logs)
     alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
     return alerts
 
 
-def calculate_slippage(trades: list[dict], transfer_logs):
+def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
 
     slippages = {}
+    settlement = trades[0]["settlement"]
 
     for trade in trades:
         buy_token_address = trade["buy_token_address"]
@@ -177,13 +184,59 @@ def calculate_slippage(trades: list[dict], transfer_logs):
             if l.contract_address == buy_token_address
         ]
 
-        amount_in = sum(
+        amount_in_th = sum(
             [l["value"] for l in token_transfers if l["to"] == trade_handler]
         )
-        amount_out = sum(
+        amount_out_th = sum(
             [l["value"] for l in token_transfers if l["from"] == trade_handler]
         )
-        slippages[buy_token_address] = amount_in - amount_out
+        slippage_th = amount_in_th - amount_out_th
+
+        amount_in_settlement = sum(
+            [l["value"] for l in token_transfers if l["to"] == settlement]
+        )
+        amount_out_settlement = sum(
+            [l["value"] for l in token_transfers if l["from"] == settlement]
+        )
+        slippage_settlement = amount_in_settlement - amount_out_settlement
+
+        slippages[buy_token_address] = slippage_th, slippage_settlement
+
+    for sell_token_address in set([trade["sell_token_address"] for trade in trades]):
+
+        if sell_token_address in slippages:
+            continue
+
+        token_transfers = [
+            l.dict()["event_arguments"]
+            for l in transfer_logs
+            if l.contract_address == sell_token_address
+        ]
+
+        amount_in_settlement = sum(
+            [l["value"] for l in token_transfers if l["to"] == settlement]
+        )
+        amount_out_settlement = sum(
+            [l["value"] for l in token_transfers if l["from"] == settlement]
+        )
+        slippage_settlement = amount_in_settlement - amount_out_settlement
+
+        slippages[sell_token_address] = 0, slippage_settlement
+
+    if WETH_ADDR in slippages:
+
+        weth_burns_settlement = sum(
+            [
+                l.dict()["event_arguments"]["wad"]
+                for l in weth_burn_logs
+                if l.contract_address == WETH_ADDR
+                and l.dict()["event_arguments"]["src"] == settlement
+            ]
+        )
+        slippages[WETH_ADDR] = (
+            slippages[WETH_ADDR][0],
+            slippages[WETH_ADDR][1] - weth_burns_settlement,
+        )
 
     return slippages
 
@@ -224,6 +277,7 @@ def enumerate_trades(logs, is_barn=False) -> list[dict]:
             "buy_amount": args["buyAmount"],
             "fee_amount": args["feeAmount"],
             "order_uid": order_uid,
+            "settlement": l.contract_address,
         }
         trades.append(trade)
 
@@ -258,13 +312,29 @@ def format_solver_alert(
         if buy_token.lower() == "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower():
             buy_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
         msg += f'    [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
-    msg += "\n✂️ *Slippages*"
-    for key in slippages:
-        token = _token_info(key)
-        slippage = slippages[key]
-        color = "🔴" if slippage < 0 else "🟢"
-        amount = round(slippage / 10**token.decimals, 4)
-        msg += f"\n   {color} {token.symbol}: {amount}"
+
+    if sum([slippage_pair[0] for slippage_pair in slippages.values()]) != 0:
+        msg += "\n✂️ *TH Slippages*"
+        for key in slippages:
+            token = _token_info(key)
+            slippage = slippages[key][0]
+            if slippage == 0:
+                continue
+            color = "🔴" if slippage < 0 else "🟢"
+            amount = round(slippage / 10**token.decimals, 4)
+            msg += f"\n   {color} {token.symbol}: {amount}"
+
+    if sum([slippage_pair[1] for slippage_pair in slippages.values()]) != 0:
+        msg += "\n✂️ *Cow Slippages And Fees*"
+        for key in slippages:
+            token = _token_info(key)
+            slippage = slippages[key][1]
+            if slippage == 0:
+                continue
+            color = "🔴" if slippage < 0 else "🟢"
+            amount = round(slippage / 10**token.decimals, 4)
+            msg += f"\n   {color} {token.symbol}: {amount}"
+
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
 
