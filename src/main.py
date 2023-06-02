@@ -202,26 +202,14 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
 
         slippages[buy_token_address] = slippage_th, slippage_settlement
 
-    for sell_token_address in set([trade["sell_token_address"] for trade in trades]):
+    for trade in trades:
+        sell_token_address = trade["sell_token_address"]
 
-        if sell_token_address in slippages:
+        if sell_token_address not in slippages:
             continue
 
-        token_transfers = [
-            l.dict()["event_arguments"]
-            for l in transfer_logs
-            if l.contract_address == sell_token_address
-        ]
-
-        amount_in_settlement = sum(
-            [l["value"] for l in token_transfers if l["to"] == settlement]
-        )
-        amount_out_settlement = sum(
-            [l["value"] for l in token_transfers if l["from"] == settlement]
-        )
-        slippage_settlement = amount_in_settlement - amount_out_settlement
-
-        slippages[sell_token_address] = 0, slippage_settlement
+        fee_amount = trade["fee_amount"]
+        slippages[sell_token_address][1] -= fee_amount 
 
     if WETH_ADDR in slippages:
 
@@ -325,7 +313,7 @@ def format_solver_alert(
             msg += f"\n   {color} {token.symbol}: {amount}"
 
     if sum([slippage_pair[1] for slippage_pair in slippages.values()]) != 0:
-        msg += "\n✂️ *Cow Slippages And Fees*"
+        msg += "\n✂️ *Cow Slippages*"
         for key in slippages:
             token = _token_info(key)
             slippage = slippages[key][1]
