@@ -200,8 +200,12 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
         )
         slippage_settlement = amount_in_settlement - amount_out_settlement
 
-        slippages[buy_token_address] = slippage_th, slippage_settlement
+        slippages[buy_token_address] = {
+            "th": slippage_th,
+            "cow": slippage_settlement,
+        }
 
+    # adjust for fees
     for trade in trades:
         sell_token_address = trade["sell_token_address"]
 
@@ -209,8 +213,9 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
             continue
 
         fee_amount = trade["fee_amount"]
-        slippages[sell_token_address][1] -= fee_amount 
+        slippages[sell_token_address]["cow"] -= fee_amount
 
+    # adjust for any weth burns
     if WETH_ADDR in slippages:
 
         weth_burns_settlement = sum(
@@ -221,10 +226,7 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
                 and l.dict()["event_arguments"]["src"] == settlement
             ]
         )
-        slippages[WETH_ADDR] = (
-            slippages[WETH_ADDR][0],
-            slippages[WETH_ADDR][1] - weth_burns_settlement,
-        )
+        slippages[WETH_ADDR]["cow"] -= weth_burns_settlement
 
     return slippages
 
@@ -301,22 +303,22 @@ def format_solver_alert(
             buy_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
         msg += f'    [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
 
-    if sum([slippage_pair[0] for slippage_pair in slippages.values()]) != 0:
+    if sum([slippage_d["th"] for slippage_d in slippages.values()]) != 0:
         msg += "\n✂️ *TH Slippages*"
         for key in slippages:
             token = _token_info(key)
-            slippage = slippages[key][0]
+            slippage = slippages[key]["th"]
             if slippage == 0:
                 continue
             color = "🔴" if slippage < 0 else "🟢"
             amount = round(slippage / 10**token.decimals, 4)
             msg += f"\n   {color} {token.symbol}: {amount}"
 
-    if sum([slippage_pair[1] for slippage_pair in slippages.values()]) != 0:
+    if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
         msg += "\n✂️ *Cow Slippages*"
         for key in slippages:
             token = _token_info(key)
-            slippage = slippages[key][1]
+            slippage = slippages[key]["cow"]
             if slippage == 0:
                 continue
             color = "🔴" if slippage < 0 else "🟢"
