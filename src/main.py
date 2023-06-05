@@ -311,8 +311,8 @@ def format_solver_alert(
             if slippage == 0:
                 continue
             color = "🔴" if slippage < 0 else "🟢"
-            amount = round(slippage / 10**token.decimals, 4)
-            msg += f"\n   {color} {token.symbol}: {amount}"
+            amount = slippage / 10**token.decimals
+            msg += f"\n   {color} {token.symbol}: {amount:,.4}"
 
     if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
         msg += "\n✂️ *Cow Slippages*"
@@ -322,8 +322,8 @@ def format_solver_alert(
             if slippage == 0:
                 continue
             color = "🔴" if slippage < 0 else "🟢"
-            amount = round(slippage / 10**token.decimals, 4)
-            msg += f"\n   {color} {token.symbol}: {amount}"
+            amount = slippage / 10**token.decimals
+            msg += f"\n   {color} {token.symbol}: {amount:,.4}"
 
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
@@ -341,7 +341,7 @@ def calc_gas_cost(txn_receipt):
         )
         / 10**6
     )
-    return f"💸 ${round(gas_cost,2):,} | {round(eth_used/1e18,4)} ETH"
+    return f"💸 ${gas_cost:,.2f} | {eth_used/1e18:,.4f} ETH"
 
 
 def process_revert(txn_hash: str) -> None | str:
