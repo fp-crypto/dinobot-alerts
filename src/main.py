@@ -312,7 +312,8 @@ def format_solver_alert(
                 continue
             color = "🔴" if slippage < 0 else "🟢"
             amount = slippage / 10**token.decimals
-            msg += f"\n   {color} {token.symbol}: {amount:,.4}"
+            amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.2e}").format(amount) 
+            msg += f"\n   {color} {token.symbol}: {amount}"
 
     if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
         msg += "\n✂️ *Cow Slippages*"
@@ -323,7 +324,8 @@ def format_solver_alert(
                 continue
             color = "🔴" if slippage < 0 else "🟢"
             amount = slippage / 10**token.decimals
-            msg += f"\n   {color} {token.symbol}: {amount:,.4}"
+            amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.2e}").format(amount) 
+            msg += f"\n   {color} {token.symbol}: {amount}"
 
     msg += f"\n\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
