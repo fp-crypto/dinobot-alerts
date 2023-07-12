@@ -34,9 +34,19 @@ cowswap_prod_api_base_url = "https://api.cow.fi/mainnet/api/v1/"
 cowswap_barn_api_base_url = "https://barn.api.cow.fi/mainnet/api/v1/"
 
 trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
-barn_solver = "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330"
-prod_solver = "0x43872b55A12E087935765611851E94e3f0a79249"
-solvers = [barn_solver, prod_solver]
+
+barn_solvers: list[str] = [
+    "0x8a4e90e9afc809a69d2a3bdbe5fff17a12979609",
+    "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330",
+    "0xAc6Cc8E2f0232B5B213503257C861235F4ED42c1",
+]
+prod_solvers: list[str] = [
+    "0x398890be7c4fac5d766e1aeffde44b2ee99f38ef",
+    "0x43872b55A12E087935765611851E94e3f0a79249",
+    "0x0DdcB0769a3591230cAa80F85469240b71442089",
+]
+solvers: list[str] = barn_solvers + prod_solvers
+
 signing_key = (
     environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
 )
@@ -154,7 +164,9 @@ def generate_solver_alerts(txn_hash: str) -> list[str]:
     if solver == None:
         return []
 
-    trades = enumerate_trades(trade_logs, is_barn=solver.lower() == barn_solver.lower())
+    trades = enumerate_trades(
+        trade_logs, is_barn=solver.lower() in map(str.lower, barn_solvers)
+    )
     slippage = calculate_slippage(trades, transfer_logs, weth_burn_logs)
     alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
@@ -200,6 +212,9 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
         )
         slippage_settlement = amount_in_settlement - amount_out_settlement
 
+        if slippage_th == 0 and slippage_settlement == 0:
+            continue
+
         slippages[buy_token_address] = {
             "th": slippage_th,
             "cow": slippage_settlement,
@@ -227,6 +242,9 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
             ]
         )
         slippages[WETH_ADDR]["cow"] -= weth_burns_settlement
+
+    if WETH_ADDR in slippages and sum(slippages[WETH_ADDR].values()) == 0:
+        del slippages[WETH_ADDR]
 
     return slippages
 
@@ -291,7 +309,7 @@ def format_solver_alert(
     index = index if index != 1_000_000 else "???"
 
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
-    msg = f'{"🧜‍♂️" if solver == prod_solver else "🐓"} *New solve detected!*\n'
+    msg = f'{"🧜‍♂️" if solver in prod_solvers else "🐓"} *New solve detected!*\n'
     msg += f"by [{solver[0:7]}...]({etherscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
     msg += f"📕 *Trade(s)*:\n"
     for t in trade_data:
@@ -303,31 +321,34 @@ def format_solver_alert(
             buy_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
         msg += f'    [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
 
-    if sum([slippage_d["th"] for slippage_d in slippages.values()]) != 0:
-        msg += "\n✂️ *TH Slippages*"
-        for key in slippages:
-            token = _token_info(key)
-            slippage = slippages[key]["th"]
-            if slippage == 0:
-                continue
-            color = "🔴" if slippage < 0 else "🟢"
-            amount = slippage / 10**token.decimals
-            amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.2e}").format(amount) 
-            msg += f"\n   {color} {token.symbol}: {amount}"
+    if len(slippages) != 0:
+        if sum([slippage_d["th"] for slippage_d in slippages.values()]) != 0:
+            msg += "\n✂️ *TH Slippages*"
+            for key in slippages:
+                token = _token_info(key)
+                slippage = slippages[key]["th"]
+                if slippage == 0:
+                    continue
+                color = "🔴" if slippage < 0 else "🟢"
+                amount = slippage / 10**token.decimals
+                amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
+                msg += f"\n   {color} {token.symbol}: {amount}"
 
-    if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
-        msg += "\n✂️ *Cow Slippages*"
-        for key in slippages:
-            token = _token_info(key)
-            slippage = slippages[key]["cow"]
-            if slippage == 0:
-                continue
-            color = "🔴" if slippage < 0 else "🟢"
-            amount = slippage / 10**token.decimals
-            amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.2e}").format(amount) 
-            msg += f"\n   {color} {token.symbol}: {amount}"
+        if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
+            msg += "\n✂️ *Cow Slippages*"
+            for key in slippages:
+                token = _token_info(key)
+                slippage = slippages[key]["cow"]
+                if slippage == 0:
+                    continue
+                color = "🔴" if slippage < 0 else "🟢"
+                amount = slippage / 10**token.decimals
+                amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
+                msg += f"\n   {color} {token.symbol}: {amount}"
 
-    msg += f"\n\n{calc_gas_cost(txn_receipt)}"
+        msg += "\n"
+
+    msg += f"\n{calc_gas_cost(txn_receipt)}"
     msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
 
     return msg
@@ -354,7 +375,7 @@ def process_revert(txn_hash: str) -> None | str:
     if not failed or sender not in solvers:
         return
     msg = f"*🤬  Failed Transaction detected!*\n\n"
-    e = "🧜‍♂️" if sender == prod_solver else "🐓"
+    e = "🧜‍♂️" if sender in prod_solvers else "🐓"
     _, _, markdown = abbreviate_address(sender)
     msg += f"Sent from {markdown} {e}\n\n"
     msg += f"{calc_gas_cost(txn_receipt)}"
@@ -379,7 +400,7 @@ def abbreviate_address(address):
 
 async def send_message(msg):
     if alerts_enabled:
-        chat_ids = [CHAT_IDS["SEASOLVER"], CHAT_IDS["SEASOLVER_SA"]]
+        chat_ids = [CHAT_IDS["SEASOLVER"]]#, CHAT_IDS["SEASOLVER_SA"]]
     else:
         chat_ids = [CHAT_IDS["FP_ALERTS"]]
     return await asyncio.wait(
