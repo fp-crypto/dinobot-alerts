@@ -76,6 +76,11 @@ _processed_hashes: set[str] = set()
 
 notification_lock = asyncio.Lock()
 
+# monkey patch to avoid issue parsing access_list
+from ape_ethereum.transactions import DynamicFeeTransaction
+DynamicFeeTransaction.__fields__["access_list"].allow_none = True
+
+
 
 @app.post("/solver/solve", status_code=200)
 async def alert_solver_solve(alert: Alert, request: Request) -> dict:
