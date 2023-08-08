@@ -77,9 +77,10 @@ _processed_hashes: set[str] = set()
 notification_lock = asyncio.Lock()
 
 # monkey patch to avoid issue parsing access_list
-from ape_ethereum.transactions import DynamicFeeTransaction
-DynamicFeeTransaction.__fields__["access_list"].allow_none = True
+from ape_ethereum.transactions import DynamicFeeTransaction, AccessListTransaction
 
+DynamicFeeTransaction.__fields__["access_list"].allow_none = True
+AccessListTransaction.__fields__["access_list"].allow_none = True
 
 
 @app.post("/solver/solve", status_code=200)
@@ -405,7 +406,7 @@ def abbreviate_address(address):
 
 async def send_message(msg):
     if alerts_enabled:
-        chat_ids = [CHAT_IDS["SEASOLVER"]]#, CHAT_IDS["SEASOLVER_SA"]]
+        chat_ids = [CHAT_IDS["SEASOLVER"]]  # , CHAT_IDS["SEASOLVER_SA"]]
     else:
         chat_ids = [CHAT_IDS["FP_ALERTS"]]
     return await asyncio.wait(
