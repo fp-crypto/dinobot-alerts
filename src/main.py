@@ -1,6 +1,7 @@
+from ape.api.providers import ProviderAPI
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from ape import chain, project, networks
+from ape import project, networks
 from ape.contracts import ContractInstance
 from ape.api.transactions import ReceiptAPI
 from telebot.async_telebot import AsyncTeleBot
@@ -18,8 +19,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 
-geth_url = environ["GETH_URL"]
-network = networks.parse_network_choice(f"ethereum:mainnet:{geth_url}")
+eth_rpc_url = environ["GETH_URL"]
+gc_rpc_url = environ["GC_RPC_URL"]
+network = networks.parse_network_choice(f"ethereum:mainnet:{eth_rpc_url}")
 
 app = FastAPI(on_startup=[network.__enter__], on_shutdown=[network.__exit__])
 
@@ -30,20 +32,27 @@ alerts_enabled = (
 )
 
 etherscan_base_url = "https://etherscan.io/"
+gnosisscan_base_url = "https://gnosisscan.io/"
+
 cowswap_prod_api_base_url = "https://api.cow.fi/mainnet/api/v1/"
 cowswap_barn_api_base_url = "https://barn.api.cow.fi/mainnet/api/v1/"
 
-trade_handler = "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b"
+trade_handler = {
+    1: "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b",
+    100: "0x67a5802068f9E1ee03821Be0cD7f46D04f4dF33A",
+}
 
 barn_solvers: list[str] = [
     "0x8a4e90e9afc809a69d2a3bdbe5fff17a12979609",
     "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330",
     "0xAc6Cc8E2f0232B5B213503257C861235F4ED42c1",
+    "0xC8D2f12a9505a82C4f6994204f4BbF095183E63A",  # gnosis chain sover
 ]
 prod_solvers: list[str] = [
     "0x398890be7c4fac5d766e1aeffde44b2ee99f38ef",
     "0x43872b55A12E087935765611851E94e3f0a79249",
     "0x0DdcB0769a3591230cAa80F85469240b71442089",
+    "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain sover
 ]
 solvers: list[str] = barn_solvers + prod_solvers
 
@@ -59,11 +68,29 @@ CHAT_IDS = {
     "SEASOLVER_SA": "-1001829083462",
 }
 
-ETH_ADDR = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+NATIVE_TOKEN_ADDR = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 WETH_ADDR = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+WXDAI_ADDR = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
+
 MKR_ADDR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
 
 COW_SWAP_ETH_FLOW_ADDR = "0x40A50cf069e992AA4536211B23F286eF88752187"
+COW_SWAP_SETTLEMENT_ADDR = "0x9008d19f58aabd9ed0d60971565aa8510560ab41"
+
+CHAINS: dict[int, str] = {
+    1: "eth",
+    100: "gc",
+}
+
+APE_NETWORK_STRING: dict[int, str] = {
+    1: f"ethereum:mainnet:{eth_rpc_url}",
+    100: f"gnosis:mainnet:{gc_rpc_url}",
+}
+
+WRAPPED_NATIVE_TOKEN_ADDR: dict[int, str] = {
+    1: WETH_ADDR,
+    100: WXDAI_ADDR,
+}
 
 
 class Alert(BaseModel):
@@ -91,18 +118,19 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
 
     txn = alert.transaction
     hash = txn["hash"]
+    chain_id = int(txn["network"])
 
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
-
-    msgs = await asyncio.get_event_loop().run_in_executor(
-        sync_threads, generate_solver_alerts, hash
-    )
 
     async with notification_lock:
         # Check again
         if hash in _processed_hashes:
             return {"success": True, "is_redundant": True}
+
+        msgs = await asyncio.get_event_loop().run_in_executor(
+            sync_threads, generate_solver_alerts, hash, chain_id
+        )
 
         calls = []
         for msg in msgs:
@@ -122,18 +150,19 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
 
     txn = alert.transaction
     hash = txn["hash"]
+    chain_id = int(txn["network"])
 
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
-
-    msg = await asyncio.get_event_loop().run_in_executor(
-        sync_threads, process_revert, hash
-    )
 
     async with notification_lock:
         # Check again
         if hash in _processed_hashes:
             return {"success": True, "is_redundant": True}
+
+        msg = await asyncio.get_event_loop().run_in_executor(
+            sync_threads, process_revert, hash, chain_id
+        )
 
         await send_message(msg)
 
@@ -142,44 +171,49 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
     return {"success": True}
 
 
-def generate_solver_alerts(txn_hash: str) -> list[str]:
+def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
+    with networks.parse_network_choice(APE_NETWORK_STRING[chain_id]) as provider:
+        receipt = provider.get_receipt(txn_hash)
+        # settlement = project.Settlement.at(COW_SWAP_SETTLEMENT_ADDR)
 
-    receipt = networks.provider.get_receipt(txn_hash)
-    settlement = project.Settlement.at("0x9008d19f58aabd9ed0d60971565aa8510560ab41")
+        target_logs = receipt.decode_logs(
+            [
+                # settlement.Settlement,
+                # settlement.Trade,
+                project.Settlement.contract_type.events["Settlement"],
+                project.Settlement.contract_type.events["Trade"],
+                project.ERC20.contract_type.events["Transfer"],
+                project.WETH.contract_type.events["Withdrawal"],
+            ]
+        )
 
-    target_logs = receipt.decode_logs(
-        [
-            settlement.Settlement,
-            settlement.Trade,
-            project.ERC20.contract_type.events["Transfer"],
-            project.WETH.contract_type.events["Withdrawal"],
+        settlement_logs = [l for l in target_logs if l.event_name == "Settlement"]
+        trade_logs = [l for l in target_logs if l.event_name == "Trade"]
+        transfer_logs = [l for l in target_logs if l.event_name == "Transfer"]
+        weth_burn_logs = [
+            l
+            for l in target_logs
+            if l.event_name == "Withdrawal"
+            and l.contract_address == WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
         ]
-    )
 
-    settlement_logs = [l for l in target_logs if l.event_name == "Settlement"]
-    trade_logs = [l for l in target_logs if l.event_name == "Trade"]
-    transfer_logs = [l for l in target_logs if l.event_name == "Transfer"]
-    weth_burn_logs = [
-        l
-        for l in target_logs
-        if l.event_name == "Withdrawal" and l.contract_address == WETH_ADDR
-    ]
+        solvers = [l.dict()["event_arguments"]["solver"] for l in settlement_logs]
+        solver = next((solver for solver in solvers if solver in solvers), None)
+        if solver == None:
+            return []
 
-    solvers = [l.dict()["event_arguments"]["solver"] for l in settlement_logs]
-    solver = next((solver for solver in solvers if solver in solvers), None)
-    if solver == None:
-        return []
+        trades = enumerate_trades(
+            trade_logs,
+            is_barn=solver.lower() in map(str.lower, barn_solvers),
+            chain_id=chain_id,
+        )
+        slippage = calculate_slippage(trades, transfer_logs, weth_burn_logs, chain_id)
+        alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
-    trades = enumerate_trades(
-        trade_logs, is_barn=solver.lower() in map(str.lower, barn_solvers)
-    )
-    slippage = calculate_slippage(trades, transfer_logs, weth_burn_logs)
-    alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
-
-    return alerts
+        return alerts
 
 
-def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
+def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs, chain_id):
 
     slippages = {}
     settlement = trades[0]["settlement"]
@@ -189,8 +223,8 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
 
         # If there is a trade for eth, use weth instead since TH will never
         # get native eth
-        if buy_token_address.lower() == ETH_ADDR.lower():
-            buy_token_address = WETH_ADDR
+        if buy_token_address.lower() == NATIVE_TOKEN_ADDR.lower():
+            buy_token_address = WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
 
         # we might have calculated the slippage previously
         if buy_token_address in slippages:
@@ -203,10 +237,10 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
         ]
 
         amount_in_th = sum(
-            [l["value"] for l in token_transfers if l["to"] == trade_handler]
+            [l["value"] for l in token_transfers if l["to"] == trade_handler[chain_id]]
         )
         amount_out_th = sum(
-            [l["value"] for l in token_transfers if l["from"] == trade_handler]
+            [l["value"] for l in token_transfers if l["from"] == trade_handler[chain_id]]
         )
         slippage_th = amount_in_th - amount_out_th
 
@@ -237,32 +271,36 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs):
         slippages[sell_token_address]["cow"] -= fee_amount
 
     # adjust for any weth burns
-    if WETH_ADDR in slippages:
+    wrapped_native_token_addr: str = WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
+    if wrapped_native_token_addr in slippages:
 
         weth_burns_settlement = sum(
             [
                 l.dict()["event_arguments"]["wad"]
                 for l in weth_burn_logs
-                if l.contract_address == WETH_ADDR
+                if l.contract_address == wrapped_native_token_addr
                 and l.dict()["event_arguments"]["src"] == settlement
             ]
         )
-        slippages[WETH_ADDR]["cow"] -= weth_burns_settlement
+        slippages[wrapped_native_token_addr]["cow"] -= weth_burns_settlement
 
-    if WETH_ADDR in slippages and sum(slippages[WETH_ADDR].values()) == 0:
-        del slippages[WETH_ADDR]
+    if (
+        wrapped_native_token_addr in slippages
+        and sum(slippages[wrapped_native_token_addr].values()) == 0
+    ):
+        del slippages[wrapped_native_token_addr]
 
     return slippages
 
 
-def enumerate_trades(logs, is_barn=False) -> list[dict]:
+def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
     trades: list[dict] = []
 
     for l in logs:
         args = l.dict()["event_arguments"]
 
-        sell_token = _token_info(args["sellToken"])
-        buy_token = _token_info(args["buyToken"])
+        sell_token = _token_info(args["sellToken"], chain_id)
+        buy_token = _token_info(args["buyToken"], chain_id)
 
         owner = args["owner"]
         order_uid = "0x" + args["orderUid"].hex()
@@ -292,6 +330,7 @@ def enumerate_trades(logs, is_barn=False) -> list[dict]:
             "fee_amount": args["feeAmount"],
             "order_uid": order_uid,
             "settlement": l.contract_address,
+            "chain_id": chain_id,
         }
         trades.append(trade)
 
@@ -306,32 +345,46 @@ def format_solver_alert(
     slippages: dict,
 ) -> str:
 
-    cow_explorer_url = f'https://explorer.cow.fi/orders/{trade_data[0]["order_uid"]}'
-    cow_explorer_url = f"https://explorer.cow.fi/tx/{txn_hash}"
+    is_gnosis = txn_receipt.chain_id == 100
+
+    if is_gnosis:
+        cow_explorer_url = (
+            f'https://explorer.cow.fi/gc/orders/{trade_data[0]["order_uid"]}'
+        )
+        cow_explorer_url = f"https://explorer.cow.fi/gc/tx/{txn_hash}"
+    else:
+        cow_explorer_url = (
+            f'https://explorer.cow.fi/orders/{trade_data[0]["order_uid"]}'
+        )
+        cow_explorer_url = f"https://explorer.cow.fi/tx/{txn_hash}"
+
     ethtx_explorer_url = f"https://ethtx.info/mainnet/{txn_hash}"
     eigen_url = f"https://eigenphi.io/mev/eigentx/{txn_hash}"
-    ts = chain.blocks[txn_receipt.block_number].timestamp
+    ts = txn_receipt.provider.chain_manager.blocks[txn_receipt.block_number].timestamp
     index = get_index_in_block(txn_receipt)
     index = index if index != 1_000_000 else "???"
 
+    xyzscan_base_url = etherscan_base_url if not is_gnosis else gnosisscan_base_url
+
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
-    msg = f'{"🧜‍♂️" if solver in prod_solvers else "🐓"} *New solve detected!*\n'
-    msg += f"by [{solver[0:7]}...]({etherscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
+    msg = "🇪🇹" if not is_gnosis else "🦉️"
+    msg += f'{"🧜‍♂️" if solver in prod_solvers else "🐓"} *New solve detected!*\n'
+    msg += f"by [{solver[0:7]}...]({xyzscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
     msg += f"📕 *Trade(s)*:\n"
     for t in trade_data:
         user = t["owner"]
         sell_amt = round(t["sell_amount"] / 10 ** t["sell_token_decimals"], 4)
         buy_amt = round(t["buy_amount"] / 10 ** t["buy_token_decimals"], 4)
         buy_token = t["buy_token_address"]
-        if buy_token.lower() == "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".lower():
-            buy_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-        msg += f'    [{t["sell_token_symbol"]}]({etherscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({etherscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({etherscan_base_url}address/{user})\n'
+        if buy_token.lower() == NATIVE_TOKEN_ADDR.lower():
+            buy_token = WRAPPED_NATIVE_TOKEN_ADDR[txn_receipt.chain_id]
+        msg += f'    [{t["sell_token_symbol"]}]({xyzscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({xyzscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({xyzscan_base_url}address/{user})\n'
 
     if len(slippages) != 0:
         if sum([slippage_d["th"] for slippage_d in slippages.values()]) != 0:
             msg += "\n✂️ *TH Slippages*"
             for key in slippages:
-                token = _token_info(key)
+                token = _token_info(key, txn_receipt.chain_id)
                 slippage = slippages[key]["th"]
                 if slippage == 0:
                     continue
@@ -343,7 +396,7 @@ def format_solver_alert(
         if sum([slippage_d["cow"] for slippage_d in slippages.values()]) != 0:
             msg += "\n✂️ *Cow Slippages*"
             for key in slippages:
-                token = _token_info(key)
+                token = _token_info(key, txn_receipt.chain_id)
                 slippage = slippages[key]["cow"]
                 if slippage == 0:
                     continue
@@ -355,42 +408,60 @@ def format_solver_alert(
         msg += "\n"
 
     msg += f"\n{calc_gas_cost(txn_receipt)}"
-    msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
+    if is_gnosis:
+        msg += f"\n\n🔗 [Gnosisscan]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url})"
+    else:
+        msg += f"\n\n🔗 [Etherscan]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
 
     return msg
 
 
-def calc_gas_cost(txn_receipt):
-    oracle = project.ORACLE.at("0x83d95e0D5f402511dB06817Aff3f9eA88224B030")
-
+def calc_gas_cost(txn_receipt: ReceiptAPI):
+    provider = txn_receipt.provider
     eth_used = txn_receipt.gas_price * txn_receipt.gas_used
-    gas_cost = (
-        oracle.getNormalizedValueUsdc(
-            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", eth_used
-        )
-        / 10**6
+
+    if txn_receipt.transaction.chain_id == 100:
+        return f"💸 ${eth_used/1e18:,.4f} DAI"
+    oracle = provider.project_manager.ORACLE.at(
+        "0x83d95e0D5f402511dB06817Aff3f9eA88224B030"
     )
+
+    gas_cost = oracle.getNormalizedValueUsdc(WETH_ADDR, eth_used) / 10**6
     return f"💸 ${gas_cost:,.2f} | {eth_used/1e18:,.4f} ETH"
 
 
-def process_revert(txn_hash: str) -> None | str:
-    txn_receipt = networks.provider.get_receipt(txn_hash)
+def process_revert(txn_hash: str, chain_id: int) -> None | str:
+    with networks.parse_network_choice(APE_NETWORK_STRING[chain_id]) as provider:
+        txn_receipt = provider.get_receipt(txn_hash)
 
-    failed = txn_receipt.failed
-    sender = txn_receipt.transaction.sender
-    if not failed or sender not in solvers:
-        return
-    msg = f"*🤬  Failed Transaction detected!*\n\n"
-    e = "🧜‍♂️" if sender in prod_solvers else "🐓"
-    _, _, markdown = abbreviate_address(sender)
-    msg += f"Sent from {markdown} {e}\n\n"
-    msg += f"{calc_gas_cost(txn_receipt)}"
-    msg += f"\n\n🔗 [Etherscan]({etherscan_base_url}tx/{txn_hash}) | [Tenderly](https://dashboard.tenderly.co/tx/mainnet/{txn_hash})"
-    return msg
+        failed = txn_receipt.failed
+        sender = txn_receipt.transaction.sender
+        print(sender)
+        if not failed or sender not in solvers:
+            return
+
+        is_gnosis = txn_receipt.chain_id == 100
+        xyzscan_base_url = etherscan_base_url if not is_gnosis else gnosisscan_base_url
+        tenderly_base_url = (
+            "https://dashboard.tenderly.co/tx/mainnet/"
+            if not is_gnosis
+            else "https://dashboard.tenderly.co/tx/gnosis-chain/"
+        )
+
+        msg = f"*🤬  Failed Transaction detected!*\n\n"
+        e = "🧜‍♂️" if sender in prod_solvers else "🐓"
+        _, _, markdown = abbreviate_address(sender)
+        msg += f"Sent from {markdown} {e}\n\n"
+        msg += f"{calc_gas_cost(txn_receipt)}"
+        msg += f"\n\n🔗 [{'Ether' if not is_gnosis else 'Gnosis'}scan]({xyzscan_base_url}tx/{txn_hash}) | [Tenderly]({tenderly_base_url}{txn_hash})"
+        return msg
 
 
 def get_index_in_block(tx: ReceiptAPI):
-    hashes = [x.txn_hash.hex() for x in chain.blocks[tx.block_number].transactions]
+    hashes = [
+        x.txn_hash.hex()
+        for x in tx.provider.chain_manager.blocks[tx.block_number].transactions
+    ]
     try:
         return hashes.index(tx.txn_hash)
     except:
@@ -446,23 +517,26 @@ class TokenInfo:
 
 
 @lru_cache
-def _token_info(addr: str) -> TokenInfo:
-    token = project.ERC20.at(addr)
-    if addr == ETH_ADDR:
-        return TokenInfo(addr, "ETH", 18, None)
-    elif addr == MKR_ADDR:
-        return TokenInfo(addr, "WETH", 18, token)
-    elif addr == MKR_ADDR:
-        return TokenInfo(addr, "MKR", 18, token)
+def _token_info(addr: str, chain_id: int = 1) -> TokenInfo:
+    with networks.parse_network_choice(APE_NETWORK_STRING[chain_id]) as provider:
+        token: ContractInstance = provider.project_manager.ERC20.at(addr)
+        if addr == NATIVE_TOKEN_ADDR:
+            if chain_id == 100:
+                return TokenInfo(addr, "XDAI", 18, None)
+            return TokenInfo(addr, "ETH", 18, None)
+        elif addr == MKR_ADDR:
+            return TokenInfo(addr, "WETH", 18, token)
+        elif addr == MKR_ADDR:
+            return TokenInfo(addr, "MKR", 18, token)
 
-    decimals = token.decimals()
+        decimals = token.decimals()
 
-    try:
-        symbol = token.symbol()
-    except:
-        symbol = "? Cannot Find ?"
+        try:
+            symbol = token.symbol()
+        except:
+            symbol = "? Cannot Find ?"
 
-    return TokenInfo(addr, symbol, decimals, token)
+        return TokenInfo(addr, symbol, decimals, token)
 
 
 @lru_cache()
