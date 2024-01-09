@@ -578,13 +578,19 @@ def _token_info(addr: str, chain_id: int = 1) -> TokenInfo:
         if addr == NATIVE_TOKEN_ADDR:
             if chain_id == 100:
                 return TokenInfo(addr, "XDAI", 18, None)
-            return TokenInfo(addr, "ETH", 18, None)
-        elif addr == MKR_ADDR:
+            else:
+                return TokenInfo(addr, "ETH", 18, None)
+        elif addr == WETH_ADDR:
             return TokenInfo(addr, "WETH", 18, token)
+        elif addr == WXDAI_ADDR:
+            return TokenInfo(addr, "WXDAI", 18, token)
         elif addr == MKR_ADDR:
             return TokenInfo(addr, "MKR", 18, token)
 
-        decimals = token.decimals()
+        try:
+            decimals = token.decimals()
+        except:
+            decimals = 18
 
         try:
             symbol = token.symbol()
