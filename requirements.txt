@@ -1,7 +1,7 @@
 pyTelegramBotAPI==4.10.0
 fastapi==0.88.0
 uvicorn==0.20.0
-eth-ape>=0.5.0,<0.7.0
+eth-ape==0.6.4
 ape-solidity<0.7.0
 ape-gnosis
 ape-tokens

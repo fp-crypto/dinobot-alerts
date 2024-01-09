@@ -321,7 +321,7 @@ def calculate_slippage(
     ):
         del slippages[wrapped_native_token_addr]
 
-    if sdai_logs is not None:
+    if len(sdai_logs) != 0:
         sdai_deposit_withdraw_th = sum(
             [
                 l.dict()["event_arguments"]["shares"] * 1
