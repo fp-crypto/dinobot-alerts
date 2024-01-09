@@ -2,7 +2,7 @@ from ape.api.providers import ProviderAPI
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ape import project, networks
-from ape.contracts import ContractInstance
+from ape.contracts import ContractInstance, ContractEvent
 from ape.api.transactions import ReceiptAPI
 from telebot.async_telebot import AsyncTeleBot
 from requests import Session as ClientSession
@@ -73,6 +73,7 @@ WETH_ADDR = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 WXDAI_ADDR = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
 
 MKR_ADDR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+SDAI_ADDR = "0x83F20F44975D03b1b09e64809B757c47f942BEeA"
 
 COW_SWAP_ETH_FLOW_ADDR = "0x40A50cf069e992AA4536211B23F286eF88752187"
 COW_SWAP_SETTLEMENT_ADDR = "0x9008d19f58aabd9ed0d60971565aa8510560ab41"
@@ -93,10 +94,15 @@ WRAPPED_NATIVE_TOKEN_ADDR: dict[int, str] = {
 }
 
 
+class Transaction(BaseModel):
+    hash: str
+    network: str
+
+
 class Alert(BaseModel):
     id: str
     event_type: str | None = None
-    transaction: dict
+    transaction: Transaction
 
 
 _processed_hashes: set[str] = set()
@@ -117,8 +123,8 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Signature not valid")
 
     txn = alert.transaction
-    hash = txn["hash"]
-    chain_id = int(txn["network"])
+    hash = txn.hash
+    chain_id = int(txn.network)
 
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
@@ -150,7 +156,7 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
 
     txn = alert.transaction
     hash = txn["hash"]
-    chain_id = int(txn["network"])
+    chain_id = int(txn["network" if "network" in txn else "network_id"])
 
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
@@ -184,18 +190,31 @@ def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
                 project.Settlement.contract_type.events["Trade"],
                 project.ERC20.contract_type.events["Transfer"],
                 project.WETH.contract_type.events["Withdrawal"],
+                project.SDai.contract_type.events["Withdraw"],
+                project.SDai.contract_type.events["Deposit"],
             ]
         )
 
         settlement_logs = [l for l in target_logs if l.event_name == "Settlement"]
         trade_logs = [l for l in target_logs if l.event_name == "Trade"]
         transfer_logs = [l for l in target_logs if l.event_name == "Transfer"]
+
         weth_burn_logs = [
             l
             for l in target_logs
             if l.event_name == "Withdrawal"
             and l.contract_address == WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
         ]
+        sdai_logs = (
+            [
+                l
+                for l in target_logs
+                if l.event_name in ["Withdraw", "Deposit"]
+                and l.contract_address == SDAI_ADDR
+            ]
+            if chain_id == 1
+            else []
+        )
 
         solvers = [l.dict()["event_arguments"]["solver"] for l in settlement_logs]
         solver = next((solver for solver in solvers if solver in solvers), None)
@@ -207,13 +226,21 @@ def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
             is_barn=solver.lower() in map(str.lower, barn_solvers),
             chain_id=chain_id,
         )
-        slippage = calculate_slippage(trades, transfer_logs, weth_burn_logs, chain_id)
+        slippage = calculate_slippage(
+            trades, transfer_logs, weth_burn_logs, sdai_logs, chain_id
+        )
         alerts = [format_solver_alert(solver, txn_hash, receipt, trades, slippage)]
 
         return alerts
 
 
-def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs, chain_id):
+def calculate_slippage(
+    trades: list[dict],
+    transfer_logs: list[ContractEvent],
+    weth_burn_logs: list[ContractEvent],
+    sdai_logs: list[ContractEvent],
+    chain_id: int,
+):
 
     slippages = {}
     settlement = trades[0]["settlement"]
@@ -240,7 +267,11 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs, chain_
             [l["value"] for l in token_transfers if l["to"] == trade_handler[chain_id]]
         )
         amount_out_th = sum(
-            [l["value"] for l in token_transfers if l["from"] == trade_handler[chain_id]]
+            [
+                l["value"]
+                for l in token_transfers
+                if l["from"] == trade_handler[chain_id]
+            ]
         )
         slippage_th = amount_in_th - amount_out_th
 
@@ -289,6 +320,30 @@ def calculate_slippage(trades: list[dict], transfer_logs, weth_burn_logs, chain_
         and sum(slippages[wrapped_native_token_addr].values()) == 0
     ):
         del slippages[wrapped_native_token_addr]
+
+    if sdai_logs is not None:
+        sdai_deposit_withdraw_th = sum(
+            [
+                l.dict()["event_arguments"]["shares"] * 1
+                if l.event_name == "Deposit"
+                else -1
+                for l in sdai_logs
+                if l.dict()["event_arguments"]["owner"] == trade_handler[chain_id]
+            ]
+        )
+        sdai_deposit_withdraw_cow = sum(
+            [
+                l.dict()["event_arguments"]["shares"] * 1
+                if l.event_name == "Deposit"
+                else -1
+                for l in sdai_logs
+                if l.dict()["event_arguments"]["owner"] == settlement
+            ]
+        )
+        if SDAI_ADDR not in slippages:
+            slippages[SDAI_ADDR] = {"th": 0, "cow": 0}
+        slippages[SDAI_ADDR]["th"] += sdai_deposit_withdraw_th
+        slippages[SDAI_ADDR]["cow"] += sdai_deposit_withdraw_cow
 
     return slippages
 
@@ -389,7 +444,7 @@ def format_solver_alert(
                 if slippage == 0:
                     continue
                 color = "🔴" if slippage < 0 else "🟢"
-                amount = slippage / 10**token.decimals
+                amount = slippage / 10 ** token.decimals
                 amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
                 msg += f"\n   {color} {token.symbol}: {amount}"
 
@@ -401,7 +456,7 @@ def format_solver_alert(
                 if slippage == 0:
                     continue
                 color = "🔴" if slippage < 0 else "🟢"
-                amount = slippage / 10**token.decimals
+                amount = slippage / 10 ** token.decimals
                 amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
                 msg += f"\n   {color} {token.symbol}: {amount}"
 
@@ -426,7 +481,7 @@ def calc_gas_cost(txn_receipt: ReceiptAPI):
         "0x83d95e0D5f402511dB06817Aff3f9eA88224B030"
     )
 
-    gas_cost = oracle.getNormalizedValueUsdc(WETH_ADDR, eth_used) / 10**6
+    gas_cost = oracle.getNormalizedValueUsdc(WETH_ADDR, eth_used) / 10 ** 6
     return f"💸 ${gas_cost:,.2f} | {eth_used/1e18:,.4f} ETH"
 
 
@@ -553,4 +608,4 @@ def get_http_session() -> ClientSession:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("__main__:app", host="0.0.0.0")
+    uvicorn.run("__main__:app", host="0.0.0.0", loop="none")
