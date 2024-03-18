@@ -5,7 +5,7 @@ WORKDIR /wheels
 COPY requirements.txt requirements.txt
 RUN pip install wheel && pip wheel -r requirements.txt --wheel-dir=/wheels
 
-FROM python:3.10.10-slim
+FROM python:3.10-slim
 
 # Allow statements and log messages to immediately appear in the Knative logs
 ENV PYTHONUNBUFFERED True

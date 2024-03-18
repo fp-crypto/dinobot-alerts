@@ -54,7 +54,14 @@ prod_solvers: list[str] = [
     "0x0DdcB0769a3591230cAa80F85469240b71442089",
     "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain sover
 ]
-solvers: list[str] = barn_solvers + prod_solvers
+barn_v2_solvers: list[str] = [
+    "0x94aEF67903bFe8Bf65193A78074C887ba901d043",  # v2 solver
+]
+
+prod_v2_solvers: list[str] = [
+    #insert
+]
+solvers: list[str] = barn_solvers + prod_solvers + barn_v2_solvers + prod_v2_solvers
 
 signing_key = (
     environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
@@ -110,10 +117,10 @@ _processed_hashes: set[str] = set()
 notification_lock = asyncio.Lock()
 
 # monkey patch to avoid issue parsing access_list
-from ape_ethereum.transactions import DynamicFeeTransaction, AccessListTransaction
+# from ape_ethereum.transactions import DynamicFeeTransaction, AccessListTransaction
 
-DynamicFeeTransaction.__fields__["access_list"].allow_none = True
-AccessListTransaction.__fields__["access_list"].allow_none = True
+# DynamicFeeTransaction.__fields__["access_list"].allow_none = True
+# AccessListTransaction.__fields__["access_list"].allow_none = True
 
 
 @app.post("/solver/solve", status_code=200)
@@ -423,7 +430,11 @@ def format_solver_alert(
 
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
     msg = "🇪🇹" if not is_gnosis else "🦉️"
-    msg += f'{"🧜‍♂️" if solver in prod_solvers else "🐓"} *New solve detected!*\n'
+    if solver in barn_v2_solvers + prod_v2_solvers:
+        msg += f'{"🐬" if solver in prod_v2_solvers else "🐔"}'
+    else:
+        msg += f'{"🧜‍♂️" if solver in prod_solvers else "🐓"}'
+    msg += ' *New solve detected!*\n'
     msg += f"by [{solver[0:7]}...]({xyzscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
     msg += f"📕 *Trade(s)*:\n"
     for t in trade_data:
@@ -444,7 +455,7 @@ def format_solver_alert(
                 if slippage == 0:
                     continue
                 color = "🔴" if slippage < 0 else "🟢"
-                amount = slippage / 10 ** token.decimals
+                amount = slippage / 10**token.decimals
                 amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
                 msg += f"\n   {color} {token.symbol}: {amount}"
 
@@ -456,7 +467,7 @@ def format_solver_alert(
                 if slippage == 0:
                     continue
                 color = "🔴" if slippage < 0 else "🟢"
-                amount = slippage / 10 ** token.decimals
+                amount = slippage / 10**token.decimals
                 amount = ("{0:,.4f}" if amount > 1e-5 else "{0:.4}").format(amount)
                 msg += f"\n   {color} {token.symbol}: {amount}"
 
@@ -481,7 +492,7 @@ def calc_gas_cost(txn_receipt: ReceiptAPI):
         "0x83d95e0D5f402511dB06817Aff3f9eA88224B030"
     )
 
-    gas_cost = oracle.getNormalizedValueUsdc(WETH_ADDR, eth_used) / 10 ** 6
+    gas_cost = oracle.getNormalizedValueUsdc(WETH_ADDR, eth_used) / 10**6
     return f"💸 ${gas_cost:,.2f} | {eth_used/1e18:,.4f} ETH"
 
 
