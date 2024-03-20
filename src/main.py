@@ -34,8 +34,10 @@ alerts_enabled = (
 etherscan_base_url = "https://etherscan.io/"
 gnosisscan_base_url = "https://gnosisscan.io/"
 
-cowswap_prod_api_base_url = "https://api.cow.fi/mainnet/api/v1/"
-cowswap_barn_api_base_url = "https://barn.api.cow.fi/mainnet/api/v1/"
+cowswap_api_urls: dict[int, tuple[str, str]] = {
+    1: ("https://api.cow.fi/mainnet/api/v1/", "https://barn.api.cow.fi/mainnet/api/v1/"),
+    100: ("https://api.cow.fi/xdai/api/v1/", "https://barn.api.cow.fi/xdai/api/v1/"),
+}
 
 trade_handler = {
     1: "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b",
@@ -59,7 +61,7 @@ barn_v2_solvers: list[str] = [
 ]
 
 prod_v2_solvers: list[str] = [
-    #insert
+    # insert
 ]
 solvers: list[str] = barn_solvers + prod_solvers + barn_v2_solvers + prod_v2_solvers
 
@@ -298,6 +300,20 @@ def calculate_slippage(
             "cow": slippage_settlement,
         }
 
+    # try to find intermediate slippages
+    for token_addr, amount in [
+        (l.contract_address, l["value"] if l["to"] == settlement else -int(l["value"]))
+        for l in transfer_logs
+        if l.contract_address not in slippages
+        and (l["to"] == settlement or l["from"] == settlement)
+    ]:
+        if token_addr not in slippages:
+            slippages[token_addr] = {
+                "th": 0,
+                "cow": 0,
+            }
+        slippages[token_addr]["cow"] += amount
+
     # adjust for fees
     for trade in trades:
         sell_token_address = trade["sell_token_address"]
@@ -366,18 +382,22 @@ def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
 
         owner = args["owner"]
         order_uid = "0x" + args["orderUid"].hex()
+        fee = 0
 
-        if (
-            sell_token.addr.lower() == WETH_ADDR.lower()
-            and owner.lower() == COW_SWAP_ETH_FLOW_ADDR.lower()
-        ):
-            req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
-            with get_http_session().get(req_url) as r:
-                assert r.status_code == 200
-                r_json = r.json()
-                if "onchainUser" in r_json:
-                    owner = r_json["onchainUser"]
-                    sell_token.symbol = "ETH"
+        cowswap_prod_api_base_url, cowswap_barn_api_base_url = cowswap_api_urls[chain_id]
+
+        req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
+        with get_http_session().get(req_url) as r:
+            # try barn if we thought it was prod and didn't get a response
+            if r.status_code != 200 and not is_barn:
+                r.close()
+                r = get_http_session().get(f"{cowswap_barn_api_base_url}orders/{order_uid}")
+            assert r.status_code == 200
+            r_json = r.json()
+            fee = int(r_json["executedFeeAmount"]) + int(r_json["executedSurplusFee"])
+            if "onchainUser" in r_json:
+                owner = r_json["onchainUser"]
+                sell_token.symbol = "ETH" if chain_id == 1 else "XDAI"
 
         trade = {
             "owner": owner,
@@ -389,7 +409,7 @@ def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
             "buy_token_decimals": buy_token.decimals,
             "sell_amount": args["sellAmount"],
             "buy_amount": args["buyAmount"],
-            "fee_amount": args["feeAmount"],
+            "fee_amount": fee,
             "order_uid": order_uid,
             "settlement": l.contract_address,
             "chain_id": chain_id,
@@ -434,7 +454,7 @@ def format_solver_alert(
         msg += f'{"🐬" if solver in prod_v2_solvers else "🐔"}'
     else:
         msg += f'{"🧜‍♂️" if solver in prod_solvers else "🐓"}'
-    msg += ' *New solve detected!*\n'
+    msg += " *New solve detected!*\n"
     msg += f"by [{solver[0:7]}...]({xyzscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
     msg += f"📕 *Trade(s)*:\n"
     for t in trade_data:
