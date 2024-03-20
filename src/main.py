@@ -1,4 +1,5 @@
 from ape.api.providers import ProviderAPI
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ape import project, networks
@@ -18,12 +19,17 @@ from os import environ
 from dataclasses import dataclass
 from functools import lru_cache
 
-
 eth_rpc_url = environ["GETH_URL"]
 gc_rpc_url = environ["GC_RPC_URL"]
-network = networks.parse_network_choice(f"ethereum:mainnet:{eth_rpc_url}")
 
-app = FastAPI(on_startup=[network.__enter__], on_shutdown=[network.__exit__])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    get_http_session().close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 telegram_bot_key = environ["TELEGRAM_BOT_KEY"]
 bot = AsyncTeleBot(telegram_bot_key)
@@ -35,7 +41,10 @@ etherscan_base_url = "https://etherscan.io/"
 gnosisscan_base_url = "https://gnosisscan.io/"
 
 cowswap_api_urls: dict[int, tuple[str, str]] = {
-    1: ("https://api.cow.fi/mainnet/api/v1/", "https://barn.api.cow.fi/mainnet/api/v1/"),
+    1: (
+        "https://api.cow.fi/mainnet/api/v1/",
+        "https://barn.api.cow.fi/mainnet/api/v1/",
+    ),
     100: ("https://api.cow.fi/xdai/api/v1/", "https://barn.api.cow.fi/xdai/api/v1/"),
 }
 
@@ -48,20 +57,19 @@ barn_solvers: list[str] = [
     "0x8a4e90e9afc809a69d2a3bdbe5fff17a12979609",
     "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330",
     "0xAc6Cc8E2f0232B5B213503257C861235F4ED42c1",
-    "0xC8D2f12a9505a82C4f6994204f4BbF095183E63A",  # gnosis chain sover
+    "0xC8D2f12a9505a82C4f6994204f4BbF095183E63A",  # gnosis chain solver
 ]
 prod_solvers: list[str] = [
     "0x398890be7c4fac5d766e1aeffde44b2ee99f38ef",
     "0x43872b55A12E087935765611851E94e3f0a79249",
     "0x0DdcB0769a3591230cAa80F85469240b71442089",
-    "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain sover
+    "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain solver
 ]
 barn_v2_solvers: list[str] = [
     "0x94aEF67903bFe8Bf65193A78074C887ba901d043",  # v2 solver
 ]
-
 prod_v2_solvers: list[str] = [
-    # insert
+    "0x8646Ee3c5e82b495Be8F9FE2f2f213701EeD0edc",  # v2 solver
 ]
 solvers: list[str] = barn_solvers + prod_solvers + barn_v2_solvers + prod_v2_solvers
 
@@ -384,14 +392,18 @@ def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
         order_uid = "0x" + args["orderUid"].hex()
         fee = 0
 
-        cowswap_prod_api_base_url, cowswap_barn_api_base_url = cowswap_api_urls[chain_id]
+        cowswap_prod_api_base_url, cowswap_barn_api_base_url = cowswap_api_urls[
+            chain_id
+        ]
 
         req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
         with get_http_session().get(req_url) as r:
             # try barn if we thought it was prod and didn't get a response
             if r.status_code != 200 and not is_barn:
                 r.close()
-                r = get_http_session().get(f"{cowswap_barn_api_base_url}orders/{order_uid}")
+                r = get_http_session().get(
+                    f"{cowswap_barn_api_base_url}orders/{order_uid}"
+                )
             assert r.status_code == 200
             r_json = r.json()
             fee = int(r_json["executedFeeAmount"]) + int(r_json["executedSurplusFee"])
