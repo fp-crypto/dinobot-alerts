@@ -556,11 +556,11 @@ def process_revert(txn_hash: str, chain_id: int) -> None | str:
 
 
 def get_index_in_block(tx: ReceiptAPI):
-    hashes = [
-        x.txn_hash.hex()
-        for x in tx.provider.chain_manager.blocks[tx.block_number].transactions
-    ]
     try:
+        hashes = [
+            x.txn_hash.hex()
+            for x in tx.provider.chain_manager.blocks[tx.block_number].transactions
+        ]
         return hashes.index(tx.txn_hash)
     except:
         return 1_000_000  # Not found
