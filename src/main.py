@@ -29,7 +29,7 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
     yield
     await get_http_session().aclose()
 
@@ -375,24 +375,16 @@ def calculate_slippage(
     if len(sdai_logs) != 0:
         sdai_deposit_withdraw_th = sum(
             [
-                (
-                    l.dict()["event_arguments"]["shares"] * 1
-                    if l.event_name == "Deposit"
-                    else -1
-                )
+                (l.args["shares"] * (1 if l.event == "Deposit" else -1))
                 for l in sdai_logs
-                if l.dict()["event_arguments"]["owner"] == trade_handler[chain_id]
+                if l.args["owner"] == trade_handler[chain_id]
             ]
         )
         sdai_deposit_withdraw_cow = sum(
             [
-                (
-                    l.dict()["event_arguments"]["shares"] * 1
-                    if l.event_name == "Deposit"
-                    else -1
-                )
+                (l.args["shares"] * (1 if l.event == "Deposit" else -1))
                 for l in sdai_logs
-                if l.dict()["event_arguments"]["owner"] == settlement
+                if l.args["owner"] == settlement
             ]
         )
         if SDAI_ADDR not in slippages:
