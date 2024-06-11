@@ -21,9 +21,8 @@ from os import environ
 from dataclasses import dataclass
 
 from .util import get_contract
+from .chain_values import Network, CHAIN_VALUES
 
-eth_rpc_url = environ["GETH_URL"]
-gc_rpc_url = environ["GC_RPC_URL"]
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -42,33 +41,20 @@ alerts_enabled = (
     True if "ALERTS_ENABLED" in environ and environ["ALERTS_ENABLED"] == "1" else False
 )
 
-etherscan_base_url = "https://etherscan.io/"
-gnosisscan_base_url = "https://gnosisscan.io/"
-
-cowswap_api_urls: dict[int, tuple[str, str]] = {
-    1: (
-        "https://api.cow.fi/mainnet/api/v1/",
-        "https://barn.api.cow.fi/mainnet/api/v1/",
-    ),
-    100: ("https://api.cow.fi/xdai/api/v1/", "https://barn.api.cow.fi/xdai/api/v1/"),
-}
-
-trade_handler = {
-    1: "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b",
-    100: "0x67a5802068f9E1ee03821Be0cD7f46D04f4dF33A",
-}
 
 barn_solvers: list[str] = [
     "0x8a4e90e9afc809a69d2a3bdbe5fff17a12979609",
     "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330",
     "0xAc6Cc8E2f0232B5B213503257C861235F4ED42c1",
     "0xC8D2f12a9505a82C4f6994204f4BbF095183E63A",  # gnosis chain solver
+    "0x2633bd8e5FDf7C72Aca1d291CA11bdB717A6aa3d",  # arbitrum solver
 ]
 prod_solvers: list[str] = [
     "0x398890be7c4fac5d766e1aeffde44b2ee99f38ef",
     "0x43872b55A12E087935765611851E94e3f0a79249",
     "0x0DdcB0769a3591230cAa80F85469240b71442089",
     "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain solver
+    "0x3A485742Bd85e660e72dE0f49cC27AD7a62911B5",  # arbitrum solver
 ]
 barn_v2_solvers: list[str] = [
     "0x94aEF67903bFe8Bf65193A78074C887ba901d043",  # v2 solver
@@ -96,22 +82,7 @@ MKR_ADDR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
 SDAI_ADDR = "0x83F20F44975D03b1b09e64809B757c47f942BEeA"
 
 COW_SWAP_ETH_FLOW_ADDR = "0x40A50cf069e992AA4536211B23F286eF88752187"
-COW_SWAP_SETTLEMENT_ADDR = "0x9008d19f58aabd9ed0d60971565aa8510560ab41"
-
-CHAINS: dict[int, str] = {
-    1: "eth",
-    100: "gc",
-}
-
-APE_NETWORK_STRING: dict[int, str] = {
-    1: f"ethereum:mainnet:{eth_rpc_url}",
-    100: f"gnosis:mainnet:{gc_rpc_url}",
-}
-
-WRAPPED_NATIVE_TOKEN_ADDR: dict[int, str] = {
-    1: WETH_ADDR,
-    100: WXDAI_ADDR,
-}
+COW_SWAP_SETTLEMENT_ADDR = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
 
 
 class Transaction(BaseModel):
@@ -143,7 +114,7 @@ async def alert_solver_solve(alert: Alert, request: Request) -> dict:
     if hash in _processed_hashes:
         return {"success": True, "is_redundant": True}
 
-    msgs = await generate_solver_alerts(hash, txn, chain_id)
+    msgs = await generate_solver_alerts(hash, chain_id)
 
     async with notification_lock:
         # Check again
@@ -185,9 +156,7 @@ async def alert_solver_revert(alert: Alert, request: Request) -> dict:
     return {"success": True}
 
 
-async def generate_solver_alerts(
-    txn_hash: str, alert: Alert, chain_id: int
-) -> list[str]:
+async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
     provider = _get_web3(chain_id)
 
     receipt = await provider.eth.get_transaction_receipt(txn_hash)
@@ -233,7 +202,7 @@ async def generate_solver_alerts(
         weth.events.Withdrawal().process_log(l)
         for l in target_logs
         if event_topics[l.topics[0].hex()] == "Withdrawal"
-        and l.address == WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
+        and l.address == CHAIN_VALUES[chain_id]["WRAPPED_NATIVE_TOKEN"]
     ]
     sdai_logs = (
         [
@@ -250,6 +219,16 @@ async def generate_solver_alerts(
         else []
     )
 
+    cow_eth_before, cow_eth_after = await asyncio.gather(
+        provider.eth.get_balance(
+            COW_SWAP_SETTLEMENT_ADDR, block_identifier=receipt.blockNumber - 1
+        ),
+        provider.eth.get_balance(
+            COW_SWAP_SETTLEMENT_ADDR, block_identifier=receipt.blockNumber
+        ),
+    )
+    cow_eth_diff = cow_eth_after - cow_eth_before
+
     solvers = [l.args.solver for l in settlement_logs]
     solver = next((solver for solver in solvers if solver in solvers), None)
     if solver == None:
@@ -261,7 +240,7 @@ async def generate_solver_alerts(
         chain_id=chain_id,
     )
     slippage = calculate_slippage(
-        trades, transfer_logs, weth_burn_logs, sdai_logs, chain_id
+        trades, transfer_logs, weth_burn_logs, sdai_logs, cow_eth_diff, chain_id
     )
     alerts = [
         await format_solver_alert(solver, txn_hash, receipt, trades, slippage, chain_id)
@@ -275,6 +254,7 @@ def calculate_slippage(
     transfer_logs: list[Any],
     weth_burn_logs: list[Any],
     sdai_logs: list[Any],
+    cow_eth_diff: int,
     chain_id: int,
 ):
 
@@ -287,7 +267,7 @@ def calculate_slippage(
         # If there is a trade for eth, use weth instead since TH will never
         # get native eth
         if buy_token_address.lower() == NATIVE_TOKEN_ADDR.lower():
-            buy_token_address = WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
+            buy_token_address = CHAIN_VALUES[chain_id]["WRAPPED_NATIVE_TOKEN"]
 
         # we might have calculated the slippage previously
         if buy_token_address in slippages:
@@ -298,13 +278,17 @@ def calculate_slippage(
         ]
 
         amount_in_th = sum(
-            [l["value"] for l in token_transfers if l["to"] == trade_handler[chain_id]]
+            [
+                l["value"]
+                for l in token_transfers
+                if l["to"] == CHAIN_VALUES[chain_id]["TRADE_HANDLER"]
+            ]
         )
         amount_out_th = sum(
             [
                 l["value"]
                 for l in token_transfers
-                if l["from"] == trade_handler[chain_id]
+                if l["from"] == CHAIN_VALUES[chain_id]["TRADE_HANDLER"]
             ]
         )
         slippage_th = amount_in_th - amount_out_th
@@ -342,6 +326,8 @@ def calculate_slippage(
             }
         slippages[token_addr]["cow"] += amount
 
+    slippages[NATIVE_TOKEN_ADDR] = {"cow": cow_eth_diff, "th": 0}
+
     # adjust for fees
     for trade in trades:
         sell_token_address = trade["sell_token_address"]
@@ -353,7 +339,7 @@ def calculate_slippage(
         slippages[sell_token_address]["cow"] -= fee_amount
 
     # adjust for any weth burns
-    wrapped_native_token_addr: str = WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
+    wrapped_native_token_addr: str = CHAIN_VALUES[chain_id]["WRAPPED_NATIVE_TOKEN"]
     if wrapped_native_token_addr in slippages:
 
         weth_burns_settlement = sum(
@@ -377,7 +363,7 @@ def calculate_slippage(
             [
                 (l.args["shares"] * (1 if l.event == "Deposit" else -1))
                 for l in sdai_logs
-                if l.args["owner"] == trade_handler[chain_id]
+                if l.args["owner"] == CHAIN_VALUES[chain_id]["TRADE_HANDLER"]
             ]
         )
         sdai_deposit_withdraw_cow = sum(
@@ -410,8 +396,8 @@ async def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
         order_uid = "0x" + args["orderUid"].hex()
         fee = 0
 
-        cowswap_prod_api_base_url, cowswap_barn_api_base_url = cowswap_api_urls[
-            chain_id
+        cowswap_prod_api_base_url, cowswap_barn_api_base_url = CHAIN_VALUES[chain_id][
+            "COWSWAP_API_URLS"
         ]
 
         req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
@@ -426,7 +412,7 @@ async def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
         fee = int(r_json["executedFeeAmount"]) + int(r_json["executedSurplusFee"])
         if "onchainUser" in r_json:
             owner = r_json["onchainUser"]
-            sell_token.symbol = "ETH" if chain_id == 1 else "XDAI"
+            sell_token.symbol = "XDAI" if chain_id == 100 else "ETH"
 
         trade = {
             "owner": owner,
@@ -456,18 +442,8 @@ async def format_solver_alert(
     slippages: dict,
     chain_id: int,
 ) -> str:
-    is_gnosis = chain_id == 100
 
-    if is_gnosis:
-        cow_explorer_url = (
-            f'https://explorer.cow.fi/gc/orders/{trade_data[0]["order_uid"]}'
-        )
-        cow_explorer_url = f"https://explorer.cow.fi/gc/tx/{txn_hash}"
-    else:
-        cow_explorer_url = (
-            f'https://explorer.cow.fi/orders/{trade_data[0]["order_uid"]}'
-        )
-        cow_explorer_url = f"https://explorer.cow.fi/tx/{txn_hash}"
+    cow_explorer_url = CHAIN_VALUES[chain_id]["COWSWAP_EXPLORER_URL"] + f"tx/{txn_hash}"
 
     ethtx_explorer_url = f"https://ethtx.info/mainnet/{txn_hash}"
     eigen_url = f"https://eigenphi.io/mev/eigentx/{txn_hash}"
@@ -475,10 +451,10 @@ async def format_solver_alert(
     index = get_index_in_block(txn_receipt)
     index = index if index != 1_000_000 else "???"
 
-    xyzscan_base_url = etherscan_base_url if not is_gnosis else gnosisscan_base_url
+    xyzscan_base_url = CHAIN_VALUES[chain_id]["EXPLORER_URL"]
 
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
-    msg = "🇪🇹" if not is_gnosis else "🦉️"
+    msg = CHAIN_VALUES[chain_id]["EMOJI"]
     if solver in barn_v2_solvers + prod_v2_solvers:
         msg += f'{"🐬" if solver in prod_v2_solvers else "🐔"}'
     else:
@@ -492,7 +468,7 @@ async def format_solver_alert(
         buy_amt = round(t["buy_amount"] / 10 ** t["buy_token_decimals"], 4)
         buy_token = t["buy_token_address"]
         if buy_token.lower() == NATIVE_TOKEN_ADDR.lower():
-            buy_token = WRAPPED_NATIVE_TOKEN_ADDR[chain_id]
+            buy_token = CHAIN_VALUES[chain_id]["WRAPPED_NATIVE_TOKEN"]
         msg += f'    [{t["sell_token_symbol"]}]({xyzscan_base_url}token/{t["sell_token_address"]}) {sell_amt:,} -> [{t["buy_token_symbol"]}]({xyzscan_base_url}token/{t["buy_token_address"]}) {buy_amt:,} | [{user[0:7]}...]({xyzscan_base_url}address/{user})\n'
 
     if len(slippages) != 0:
@@ -523,30 +499,32 @@ async def format_solver_alert(
         msg += "\n"
 
     msg += f"\n{await calc_gas_cost(txn_receipt, chain_id)}"
-    if is_gnosis:
-        msg += f"\n\n🔗 [Gnosisscan]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url})"
-    else:
+    if chain_id == 1:
         msg += f"\n\n🔗 [Etherscan]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
+    else:
+        msg += f"\n\n🔗 [{CHAIN_VALUES[chain_id]['EXPLORER_NAME']}]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url})"
 
     return msg
 
 
 async def calc_gas_cost(txn_receipt: Any, chain_id):  # ReceiptAPI):
-    provider = _get_web3(chain_id)
     eth_used = txn_receipt.effectiveGasPrice * txn_receipt.gasUsed
 
     if chain_id == 100:
         return f"💸 ${eth_used/1e18:,.4f} DAI"
+
     oracle = get_contract(
-        provider, "ORACLE.json", "0x83d95e0D5f402511dB06817Aff3f9eA88224B030"
+        _get_web3(chain_id),
+        "ChainlinkOracle.json",
+        CHAIN_VALUES[chain_id]["NATIVE_USD_ORACLE"],
     )
 
-    gas_cost = (
-        await oracle.functions.getNormalizedValueUsdc(WETH_ADDR, eth_used).call(
-            block_identifier=txn_receipt.blockNumber
-        )
-        / 10**6
+    price, decimals = await asyncio.gather(
+        oracle.functions.latestAnswer().call(block_identifier=txn_receipt.blockNumber),
+        oracle.functions.decimals().call(),
     )
+
+    gas_cost = price * eth_used / 10 ** (decimals + 18)
     return f"💸 ${gas_cost:,.2f} | {eth_used/1e18:,.4f} ETH"
 
 
@@ -559,20 +537,15 @@ async def process_revert(txn_hash: str, chain_id: int) -> None | str:
     if not failed or sender not in solvers:
         return
 
-    is_gnosis = chain_id == 100
-    xyzscan_base_url = etherscan_base_url if not is_gnosis else gnosisscan_base_url
-    tenderly_base_url = (
-        "https://dashboard.tenderly.co/tx/mainnet/"
-        if not is_gnosis
-        else "https://dashboard.tenderly.co/tx/gnosis-chain/"
-    )
+    xyzscan_base_url = CHAIN_VALUES[chain_id]["EXPLORER_URL"]
+    tenderly_base_url = f"https://dashboard.tenderly.co/tx/{CHAIN_VALUES[chain_id]['TENDERLY_CHAIN_IDENTIFIER']}/"
 
     msg = f"*🤬  Failed Transaction detected!*\n\n"
     e = "🧜‍♂️" if sender in prod_solvers else "🐓"
     _, _, markdown = abbreviate_address(sender)
     msg += f"Sent from {markdown} {e}\n\n"
     msg += f"{await calc_gas_cost(txn_receipt, chain_id)}"
-    msg += f"\n\n🔗 [{'Ether' if not is_gnosis else 'Gnosis'}scan]({xyzscan_base_url}tx/{txn_hash}) | [Tenderly]({tenderly_base_url}{txn_hash})"
+    msg += f"\n\n🔗 [{CHAIN_VALUES[chain_id]['EXPLORER_NAME']}]({xyzscan_base_url}tx/{txn_hash}) | [Tenderly]({tenderly_base_url}{txn_hash})"
     return msg
 
 
@@ -659,15 +632,10 @@ async def _token_info(addr: str, chain_id: int) -> TokenInfo:
 
 @cached(cache={})
 def _get_web3(network_id: int) -> AsyncWeb3:
-    match network_id:
-        case 1:
-            http_uri = eth_rpc_url
-        case 100:
-            http_uri = gc_rpc_url
-        case _:
-            raise Exception("Bad network")
+    if Network(network_id) not in Network:
+        raise Exception("Bad network")
 
-    w3 = AsyncWeb3(AsyncHTTPProvider(http_uri))
+    w3 = AsyncWeb3(AsyncHTTPProvider(CHAIN_VALUES[network_id]["RPC_URL"]))
 
     return w3
 
