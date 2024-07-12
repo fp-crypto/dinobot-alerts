@@ -3,6 +3,7 @@ from web3.contract.contract import Contract
 from web3.contract.async_contract import AsyncContract
 import json
 from typing import overload
+from cachetools import cached
 
 
 @overload
@@ -14,7 +15,7 @@ def get_contract(w3: AsyncWeb3, abi_file: str, address: str) -> AsyncContract:
 def get_contract(w3: Web3, abi_file: str, address: str) -> Contract:
     ...
 
-
+@cached(cache={})
 def get_contract(
     w3: Web3 | AsyncWeb3, abi_file: str, address: str
 ) -> Contract | AsyncContract:

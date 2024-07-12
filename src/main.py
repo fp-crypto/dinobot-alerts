@@ -1,7 +1,8 @@
 import asyncio
+import aiostream
 from contextlib import asynccontextmanager
 from itertools import chain
-from typing import Any
+from typing import Any, AsyncIterable, AsyncIterator
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from telebot.async_telebot import AsyncTeleBot
@@ -42,27 +43,27 @@ alerts_enabled = (
 )
 
 
-barn_solvers: list[str] = [
+_barn_solvers: list[str] = [
     "0x8a4e90e9afc809a69d2a3bdbe5fff17a12979609",
     "0xD01BA5b3C4142F358EfFB4d6Cb44A11E31600330",
     "0xAc6Cc8E2f0232B5B213503257C861235F4ED42c1",
     "0xC8D2f12a9505a82C4f6994204f4BbF095183E63A",  # gnosis chain solver
     "0x2633bd8e5FDf7C72Aca1d291CA11bdB717A6aa3d",  # arbitrum solver
 ]
-prod_solvers: list[str] = [
+_prod_solvers: list[str] = [
     "0x398890be7c4fac5d766e1aeffde44b2ee99f38ef",
     "0x43872b55A12E087935765611851E94e3f0a79249",
     "0x0DdcB0769a3591230cAa80F85469240b71442089",
     "0xE3068acB5b5672408eADaD4417e7d3BA41D4FEBe",  # gnosis chain solver
     "0x3A485742Bd85e660e72dE0f49cC27AD7a62911B5",  # arbitrum solver
 ]
-barn_v2_solvers: list[str] = [
+_barn_v2_solvers: list[str] = [
     "0x94aEF67903bFe8Bf65193A78074C887ba901d043",  # v2 solver
 ]
-prod_v2_solvers: list[str] = [
+_prod_v2_solvers: list[str] = [
     "0x8646Ee3c5e82b495Be8F9FE2f2f213701EeD0edc",  # v2 solver
 ]
-solvers: list[str] = barn_solvers + prod_solvers + barn_v2_solvers + prod_v2_solvers
+# _solvers: list[str] = barn_solvers + prod_solvers + barn_v2_solvers + prod_v2_solvers
 
 signing_key = (
     environ["TENDERLY_SIGNING_KEY"] if "TENDERLY_SIGNING_KEY" in environ else ""
@@ -161,9 +162,11 @@ async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
 
     receipt = await provider.eth.get_transaction_receipt(txn_hash)
 
+    chain_values = CHAIN_VALUES[chain_id]
+
     settlement = get_contract(provider, "Settlement.json", COW_SWAP_SETTLEMENT_ADDR)
     erc20 = get_contract(provider, "ERC20.json", ZERO_ADDRESS)
-    weth = get_contract(provider, "WETH.json", WETH_ADDR)
+    weth = get_contract(provider, "WETH.json", chain_values["WRAPPED_NATIVE_TOKEN"])
     sdai = get_contract(provider, "SDai.json", SDAI_ADDR)
 
     event_topics = {
@@ -198,10 +201,14 @@ async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
         if event_topics[l.topics[0].hex()] == "Transfer"
     ]
 
-    weth_burn_logs = [
-        weth.events.Withdrawal().process_log(l)
+    weth_burn_mint_logs = [
+        (
+            weth.events.Withdrawal().process_log(l)
+            if event_topics[l["topics"][0].hex()] == "Withdrawal"
+            else weth.events.Deposit().process_log(l)
+        )
         for l in target_logs
-        if event_topics[l.topics[0].hex()] == "Withdrawal"
+        if event_topics[l.topics[0].hex()] in ["Withdrawal", "Deposit"]
         and l.address == CHAIN_VALUES[chain_id]["WRAPPED_NATIVE_TOKEN"]
     ]
     sdai_logs = (
@@ -219,7 +226,23 @@ async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
         else []
     )
 
-    cow_eth_before, cow_eth_after = await asyncio.gather(
+    solvers = [l.args.solver for l in settlement_logs]
+    solver = next((solver for solver in solvers if solver in solvers), None)
+    if solver == None:
+        return []
+
+    trades, cow_eth_before, cow_eth_after = await asyncio.gather(
+        aiostream.stream.list(
+            enumerate_trades(
+                trade_logs,
+                is_barn=solver.lower()
+                in map(
+                    lambda s: str.lower(s.address),
+                    CHAIN_VALUES[chain_id]["BARN_SOLVERS"],
+                ),
+                chain_id=chain_id,
+            )
+        ),
         provider.eth.get_balance(
             COW_SWAP_SETTLEMENT_ADDR, block_identifier=receipt.blockNumber - 1
         ),
@@ -229,18 +252,8 @@ async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
     )
     cow_eth_diff = cow_eth_after - cow_eth_before
 
-    solvers = [l.args.solver for l in settlement_logs]
-    solver = next((solver for solver in solvers if solver in solvers), None)
-    if solver == None:
-        return []
-
-    trades = await enumerate_trades(
-        trade_logs,
-        is_barn=solver.lower() in map(str.lower, barn_solvers),
-        chain_id=chain_id,
-    )
     slippage = calculate_slippage(
-        trades, transfer_logs, weth_burn_logs, sdai_logs, cow_eth_diff, chain_id
+        trades, transfer_logs, weth_burn_mint_logs, sdai_logs, cow_eth_diff, chain_id
     )
     alerts = [
         await format_solver_alert(solver, txn_hash, receipt, trades, slippage, chain_id)
@@ -252,7 +265,7 @@ async def generate_solver_alerts(txn_hash: str, chain_id: int) -> list[str]:
 def calculate_slippage(
     trades: list[dict],
     transfer_logs: list[Any],
-    weth_burn_logs: list[Any],
+    weth_burn_mint_logs: list[Any],
     sdai_logs: list[Any],
     cow_eth_diff: int,
     chain_id: int,
@@ -344,13 +357,13 @@ def calculate_slippage(
 
         weth_burns_settlement = sum(
             [
-                l.args["wad"]
-                for l in weth_burn_logs
+                (l.args["wad"] * (1 if l.event == "Deposit" else -1))
+                for l in weth_burn_mint_logs
                 if l.address == wrapped_native_token_addr
-                and l.args["src"] == settlement
+                and l.args["dst" if l.event == "Deposit" else "src"] == settlement
             ]
         )
-        slippages[wrapped_native_token_addr]["cow"] -= weth_burns_settlement
+        slippages[wrapped_native_token_addr]["cow"] += weth_burns_settlement
 
     if (
         wrapped_native_token_addr in slippages
@@ -381,37 +394,24 @@ def calculate_slippage(
     return slippages
 
 
-async def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
-    trades: list[dict] = []
+async def enumerate_trades(logs, is_barn=False, chain_id=1) -> AsyncIterable[dict]:
 
     for l in logs:
+
         args = l.args
-
-        sell_token, buy_token = await asyncio.gather(
-            _token_info(args["sellToken"], chain_id),
-            _token_info(args["buyToken"], chain_id),
-        )
-
         owner = args["owner"]
         order_uid = "0x" + args["orderUid"].hex()
-        fee = 0
+        sell_token, buy_token, order_data = await asyncio.gather(
+            _token_info(args["sellToken"], chain_id),
+            _token_info(args["buyToken"], chain_id),
+            _get_cowswap_order_data(order_uid, chain_id, is_barn),
+        )
 
-        cowswap_prod_api_base_url, cowswap_barn_api_base_url = CHAIN_VALUES[chain_id][
-            "COWSWAP_API_URLS"
-        ]
-
-        req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
-        r = await get_http_session().get(req_url)
-        # try barn if we thought it was prod and didn't get a response
-        if r.status_code != 200 and not is_barn:
-            r = await get_http_session().get(
-                f"{cowswap_barn_api_base_url}orders/{order_uid}"
-            )
-        assert r.status_code == 200
-        r_json = r.json()
-        fee = int(r_json["executedFeeAmount"]) + int(r_json["executedSurplusFee"])
-        if "onchainUser" in r_json:
-            owner = r_json["onchainUser"]
+        fee = int(order_data["executedFeeAmount"]) + int(
+            order_data["executedSurplusFee"]
+        )
+        if "onchainUser" in order_data:
+            owner = order_data["onchainUser"]
             sell_token.symbol = "XDAI" if chain_id == 100 else "ETH"
 
         trade = {
@@ -429,9 +429,24 @@ async def enumerate_trades(logs, is_barn=False, chain_id=1) -> list[dict]:
             "settlement": l.address,
             "chain_id": chain_id,
         }
-        trades.append(trade)
+        yield trade
 
-    return trades
+
+async def _get_cowswap_order_data(order_uid: str, chain_id: int, is_barn: bool) -> dict:
+    cowswap_prod_api_base_url, cowswap_barn_api_base_url = CHAIN_VALUES[chain_id][
+        "COWSWAP_API_URLS"
+    ]
+
+    req_url = f"{cowswap_prod_api_base_url if not is_barn else cowswap_barn_api_base_url}orders/{order_uid}"
+    r = await get_http_session().get(req_url)
+    # try barn if we thought it was prod and didn't get a response
+    if r.status_code != 200 and not is_barn:
+        r = await get_http_session().get(
+            f"{cowswap_barn_api_base_url}orders/{order_uid}"
+        )
+    assert r.status_code == 200
+    print(r.json())
+    return r.json()
 
 
 async def format_solver_alert(
@@ -455,10 +470,21 @@ async def format_solver_alert(
 
     dt = datetime.utcfromtimestamp(ts).strftime("%m/%d %H:%M")
     msg = CHAIN_VALUES[chain_id]["EMOJI"]
-    if solver in barn_v2_solvers + prod_v2_solvers:
-        msg += f'{"🐬" if solver in prod_v2_solvers else "🐔"}'
+
+    solver_is_v2 = solver in [
+        solver.address
+        for solver in CHAIN_VALUES[chain_id]["BARN_SOLVERS"]
+        + CHAIN_VALUES[chain_id]["PROD_SOLVERS"]
+        if solver.v2
+    ]
+    solver_is_prod = solver in [
+        solver.address for solver in CHAIN_VALUES[chain_id]["PROD_SOLVERS"]
+    ]
+
+    if solver_is_v2:
+        msg += f'{"🐬" if solver_is_prod else "🐔"}'
     else:
-        msg += f'{"🧜‍♂️" if solver in prod_solvers else "🐓"}'
+        msg += f'{"🧜‍♂️" if solver_is_prod else "🐓"}'
     msg += " *New solve detected!*\n"
     msg += f"by [{solver[0:7]}...]({xyzscan_base_url}address/{solver})  index: {index} @ {dt}\n\n"
     msg += f"📕 *Trade(s)*:\n"
@@ -499,10 +525,10 @@ async def format_solver_alert(
         msg += "\n"
 
     msg += f"\n{await calc_gas_cost(txn_receipt, chain_id)}"
+    msg += f"\n\n🔗 [{CHAIN_VALUES[chain_id]['EXPLORER_NAME']}]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url})"
     if chain_id == 1:
-        msg += f"\n\n🔗 [Etherscan]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url}) | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
-    else:
-        msg += f"\n\n🔗 [{CHAIN_VALUES[chain_id]['EXPLORER_NAME']}]({xyzscan_base_url}tx/{txn_hash}) | [Cow]({cow_explorer_url})"
+        msg += f" | [Eigen]({eigen_url}) | [EthTx]({ethtx_explorer_url})"
+    msg += f" | [Comp]({CHAIN_VALUES[chain_id]['COWSWAP_API_URLS'][0 if solver_is_prod else 1]}solver_competition/by_tx_hash/{txn_hash})"
 
     return msg
 
@@ -617,13 +643,17 @@ async def _token_info(addr: str, chain_id: int) -> TokenInfo:
     elif addr == MKR_ADDR:
         return TokenInfo(addr, "MKR", 18, token)
 
+    async with asyncio.TaskGroup() as tg:
+        decimals_task = tg.create_task(token.functions.decimals().call())
+        symbol_task = tg.create_task(token.functions.symbol().call())
+
     try:
-        decimals = await token.functions.decimals().call()
+        decimals = decimals_task.result()
     except:
         decimals = 18
 
     try:
-        symbol = await token.functions.symbol().call()
+        symbol = symbol_task.result()
     except:
         symbol = "? Cannot Find ?"
 

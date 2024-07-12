@@ -8,3 +8,4 @@ asyncache
 types-cachetools
 rich
 black
+aiostream
