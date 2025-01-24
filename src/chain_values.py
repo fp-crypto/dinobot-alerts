@@ -8,6 +8,7 @@ class Network(IntEnum):
     Mainnet = 1
     Gnosis = 100
     Arbitrum = 42161
+    Base = 8453
 
 
 @dataclass
@@ -32,6 +33,7 @@ class ChainValues(TypedDict):
     COWSWAP_EXPLORER_URL: str
     COWSWAP_API_URLS: Tuple[str, str]
     TRADE_HANDLER: str
+    MESSAGE_THREAD_ID: int
 
 
 CHAIN_VALUES: dict[int, ChainValues] = {
@@ -64,6 +66,7 @@ CHAIN_VALUES: dict[int, ChainValues] = {
             "https://barn.api.cow.fi/mainnet/api/v1/",
         ),
         "TRADE_HANDLER": "0xb634316E06cC0B358437CbadD4dC94F1D3a92B3b",
+        "MESSAGE_THREAD_ID": 76493,
     },
     Network.Gnosis: {
         "NETWORK_NAME": "Gnosis Chain",
@@ -88,6 +91,7 @@ CHAIN_VALUES: dict[int, ChainValues] = {
             "https://barn.api.cow.fi/xdai/api/v1/",
         ),
         "TRADE_HANDLER": "0x67a5802068f9E1ee03821Be0cD7f46D04f4dF33A",
+        "MESSAGE_THREAD_ID": 76495,
     },
     Network.Arbitrum: {
         "NETWORK_NAME": "Arbitrum",
@@ -112,5 +116,31 @@ CHAIN_VALUES: dict[int, ChainValues] = {
             "https://barn.api.cow.fi/arbitrum_one/api/v1/",
         ),
         "TRADE_HANDLER": "0x1111111111111111111111111111111111111111",  # fake address
+        "MESSAGE_THREAD_ID": 76494,
+    },
+    Network.Base: {
+        "NETWORK_NAME": "Base",
+        "NETWORK_SYMBOL": "base",
+        "NETWORK_NATIVE_TOKEN": "ETH",
+        "WRAPPED_NATIVE_TOKEN": "0x4200000000000000000000000000000000000006",
+        "RPC_URL": environ["BASE_RPC_URL"],
+        "BARN_SOLVERS": [
+            Solver("0x351DfD19DfA0e3BfD3E7D9B22658C09e66Fd14AD"),
+        ],
+        "PROD_SOLVERS": [
+            Solver("0x4cb862e4821fea2dabbd1f0a69c17d52da2a58f6"),
+        ],
+        "EMOJI": "🔵",
+        "NATIVE_USD_ORACLE": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+        "EXPLORER_URL": "https://basescan.org/",
+        "EXPLORER_NAME": "BaseScan",
+        "TENDERLY_CHAIN_IDENTIFIER": "base",
+        "COWSWAP_EXPLORER_URL": "https://explorer.cow.fi/base/",
+        "COWSWAP_API_URLS": (
+            "https://api.cow.fi/base/api/v1/",
+            "https://barn.api.cow.fi/base/api/v1/",
+        ),
+        "TRADE_HANDLER": "0x1111111111111111111111111111111111111111",  # fake address
+        "MESSAGE_THREAD_ID": 93875,
     },
 }
